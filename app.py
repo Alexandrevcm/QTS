@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Quadro Semanal de Instrutores - v1.3.3
+Quadro Semanal de Instrutores - v1.3.4
 
 Sistema web simples para:
 - cadastrar instrutores;
@@ -59,7 +59,7 @@ except Exception:
 
 
 APP_NAME = "Quadro Semanal de Instrutores"
-APP_VERSION = "1.3.3"
+APP_VERSION = "1.3.4"
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 DB_PATH = DATA_DIR / "quadro_instrutores.db"
@@ -138,6 +138,17 @@ def formatar_data_br_valor(valor: Any) -> str:
     if pd.isna(ts):
         return "—"
     return ts.strftime("%d/%m/%Y")
+
+
+def data_para_date(valor: Any, padrao: date | None = None) -> date | None:
+    """Converte datas vindas do SQLite/PostgreSQL/Pandas para date sem derrubar o app."""
+    ts = data_para_timestamp(valor)
+    if pd.isna(ts):
+        return padrao
+    try:
+        return ts.date()
+    except Exception:
+        return padrao
 
 
 def dia_semana_pt_valor(valor: Any) -> str:
@@ -517,19 +528,18 @@ def status_banco() -> str:
 
 
 
-def br_date(valor: str | date | None) -> str:
-    if not valor:
-        return ""
-    if isinstance(valor, date):
-        return valor.strftime("%d/%m/%Y")
-    return datetime.strptime(str(valor)[:10], "%Y-%m-%d").strftime("%d/%m/%Y")
+def br_date(valor: str | date | datetime | None) -> str:
+    """Formata data em DD/MM/AAAA aceitando formatos do SQLite/PostgreSQL/Supabase."""
+    texto = formatar_data_br_valor(valor)
+    return "" if texto == "—" else texto
 
-def iso_date(valor: date | datetime | str) -> str:
-    if isinstance(valor, datetime):
-        return valor.date().isoformat()
-    if isinstance(valor, date):
-        return valor.isoformat()
-    return str(valor)[:10]
+
+def iso_date(valor: date | datetime | str | None) -> str:
+    """Converte data para YYYY-MM-DD aceitando formatos variados."""
+    data_ok = data_para_date(valor)
+    if data_ok is None:
+        return ""
+    return data_ok.isoformat()
 
 
 def hora_str(valor: time | str) -> str:
@@ -565,8 +575,10 @@ def periodo_com_carga(hora_inicio: str, hora_fim: str, carga_horaria: Any = 0) -
 
 
 def datas_uteis_da_semana(data_inicio: str | date, data_fim: str | date) -> list[date]:
-    inicio = datetime.strptime(str(data_inicio)[:10], "%Y-%m-%d").date() if not isinstance(data_inicio, date) else data_inicio
-    fim = datetime.strptime(str(data_fim)[:10], "%Y-%m-%d").date() if not isinstance(data_fim, date) else data_fim
+    inicio = data_para_date(data_inicio)
+    fim = data_para_date(data_fim)
+    if inicio is None or fim is None:
+        return []
     dias: list[date] = []
     atual = inicio
     while atual <= fim:
@@ -1109,8 +1121,11 @@ def gerar_texto_whatsapp(df: pd.DataFrame, semana: sqlite3.Row) -> str:
         data = row["data_aula"]
         if data != data_atual:
             data_atual = data
-            dt = datetime.strptime(data, "%Y-%m-%d").date()
-            linhas.append(f"*{DIAS_PT[dt.weekday()]} - {br_date(dt)}*")
+            dt = data_para_date(data)
+            if dt is None:
+                linhas.append(f"*Data não identificada - {br_date(data)}*")
+            else:
+                linhas.append(f"*{DIAS_PT[dt.weekday()]} - {br_date(dt)}*")
         instrutores = row["instrutores"] if pd.notna(row["instrutores"]) and row["instrutores"] else "Pendente"
         local = f" - {row['local']}" if row["local"] else ""
         descricao = descricao_aula(row.get("disciplina", ""))
@@ -1310,9 +1325,10 @@ def pagina_escolha_publica(token: str) -> None:
         with st.container(border=True):
             col1, col2 = st.columns([4, 1])
             with col1:
-                data_aula = datetime.strptime(row["data_aula"], "%Y-%m-%d").date()
+                data_aula = data_para_date(row["data_aula"])
                 periodo = periodo_com_carga(row["hora_inicio"], row["hora_fim"], row.get("carga_horaria", 0))
-                st.markdown(f"**{DIAS_PT[data_aula.weekday()]} - {br_date(data_aula)} | {periodo}**")
+                dia_txt = DIAS_PT[data_aula.weekday()] if data_aula is not None else "Data não identificada"
+                st.markdown(f"**{dia_txt} - {br_date(row['data_aula'])} | {periodo}**")
                 st.write(f"**Descrição:** {descricao_aula(row['disciplina'])}")
                 detalhes = []
                 if row["local"]:
@@ -1717,11 +1733,13 @@ def aba_horarios() -> None:
     with st.form("novo_horario"):
         col1, col2, col3, col4, col5 = st.columns(5)
         with col1:
+            data_inicio_semana = data_para_date(semana["data_inicio"], date.today())
+            data_fim_semana = data_para_date(semana["data_fim"], data_inicio_semana)
             data_aula = st.date_input(
                 "Data",
-                value=datetime.strptime(semana["data_inicio"], "%Y-%m-%d").date(),
-                min_value=datetime.strptime(semana["data_inicio"], "%Y-%m-%d").date(),
-                max_value=datetime.strptime(semana["data_fim"], "%Y-%m-%d").date(),
+                value=data_inicio_semana,
+                min_value=data_inicio_semana,
+                max_value=data_fim_semana,
             )
         with col2:
             hora_inicio = st.time_input("Início", value=time(8, 0))
