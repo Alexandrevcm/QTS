@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Quadro Semanal de Instrutores - v1.3.7
+Quadro Semanal de Instrutores - v1.3.8
 
 Sistema web simples para:
 - cadastrar instrutores;
@@ -13,7 +13,8 @@ Sistema web simples para:
 - permitir inclusão manual de escolhas pelo administrador;
 - publicar online com banco compartilhado PostgreSQL/Supabase quando configurado;
 - corrigir leitura de tabelas do PostgreSQL sem linhas genéricas de nomes de colunas;
-- corrigir geração/visualização da grade padrão no PostgreSQL/Streamlit Cloud.
+- corrigir geração/visualização da grade padrão no PostgreSQL/Streamlit Cloud;
+- adicionar cache de consultas, identificação por seleção e finalização do instrutor.
 
 Rodar localmente:
     streamlit run app.py
@@ -61,11 +62,12 @@ except Exception:
 
 
 APP_NAME = "Quadro Semanal de Instrutores"
-APP_VERSION = "1.3.7"
+APP_VERSION = "1.3.8"
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 DB_PATH = DATA_DIR / "quadro_instrutores.db"
 DATA_DIR.mkdir(exist_ok=True)
+CACHE_TTL_SECONDS = 20
 
 st.set_page_config(
     page_title=APP_NAME,
@@ -383,6 +385,14 @@ def get_conn():
     return conectar()
 
 
+def limpar_cache_dados() -> None:
+    """Limpa o cache das consultas após qualquer gravação no banco."""
+    try:
+        st.cache_data.clear()
+    except Exception:
+        pass
+
+
 def executar(sql: str, params: tuple[Any, ...] = ()):  # cursor sqlite ou psycopg2
     conn = get_conn()
     try:
@@ -392,6 +402,7 @@ def executar(sql: str, params: tuple[Any, ...] = ()):  # cursor sqlite ou psycop
         else:
             cur = conn.execute(sql, params)
         conn.commit()
+        limpar_cache_dados()
         return cur
     except Exception:
         conn.rollback()
@@ -416,9 +427,15 @@ def inserir_retornando_id(sql: str, params: tuple[Any, ...] = ()) -> int:
     return novo_id
 
 
-def consultar(sql: str, params: tuple[Any, ...] = ()) -> pd.DataFrame:
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
+def consultar_cacheado(sql_original: str, params: tuple[Any, ...], backend: str) -> pd.DataFrame:
+    """Consulta cacheada para reduzir acessos repetidos ao PostgreSQL/Supabase."""
     conn = get_conn()
-    return pd.read_sql_query(sql_db(sql), conn, params=params)
+    return pd.read_sql_query(sql_db(sql_original), conn, params=params)
+
+
+def consultar(sql: str, params: tuple[Any, ...] = ()) -> pd.DataFrame:
+    return consultar_cacheado(sql, tuple(params or ()), db_backend())
 
 
 def consultar_um(sql: str, params: tuple[Any, ...] = ()):
@@ -514,11 +531,22 @@ def init_db_sqlite() -> None:
             UNIQUE (horario_id, instrutor_id)
         );
 
+        CREATE TABLE IF NOT EXISTS finalizacoes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            semana_id INTEGER NOT NULL,
+            instrutor_id INTEGER NOT NULL,
+            finalizado_em TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (semana_id) REFERENCES semanas(id) ON DELETE CASCADE,
+            FOREIGN KEY (instrutor_id) REFERENCES instrutores(id) ON DELETE CASCADE,
+            UNIQUE (semana_id, instrutor_id)
+        );
+
         CREATE INDEX IF NOT EXISTS idx_instrutores_matricula ON instrutores(matricula);
         CREATE INDEX IF NOT EXISTS idx_semanas_token ON semanas(token);
         CREATE INDEX IF NOT EXISTS idx_horarios_semana ON horarios(semana_id);
         CREATE INDEX IF NOT EXISTS idx_escolhas_horario ON escolhas(horario_id);
         CREATE INDEX IF NOT EXISTS idx_escolhas_instrutor ON escolhas(instrutor_id);
+        CREATE INDEX IF NOT EXISTS idx_finalizacoes_semana_instrutor ON finalizacoes(semana_id, instrutor_id);
         """
     )
     migracoes = [
@@ -595,11 +623,21 @@ def init_db_postgres() -> None:
             UNIQUE (horario_id, instrutor_id)
         )
         """,
+        """
+        CREATE TABLE IF NOT EXISTS finalizacoes (
+            id SERIAL PRIMARY KEY,
+            semana_id INTEGER NOT NULL REFERENCES semanas(id) ON DELETE CASCADE,
+            instrutor_id INTEGER NOT NULL REFERENCES instrutores(id) ON DELETE CASCADE,
+            finalizado_em TEXT NOT NULL DEFAULT to_char(now(), 'YYYY-MM-DD"T"HH24:MI:SS'),
+            UNIQUE (semana_id, instrutor_id)
+        )
+        """,
         "CREATE INDEX IF NOT EXISTS idx_instrutores_matricula ON instrutores(matricula)",
         "CREATE INDEX IF NOT EXISTS idx_semanas_token ON semanas(token)",
         "CREATE INDEX IF NOT EXISTS idx_horarios_semana ON horarios(semana_id)",
         "CREATE INDEX IF NOT EXISTS idx_escolhas_horario ON escolhas(horario_id)",
         "CREATE INDEX IF NOT EXISTS idx_escolhas_instrutor ON escolhas(instrutor_id)",
+        "CREATE INDEX IF NOT EXISTS idx_finalizacoes_semana_instrutor ON finalizacoes(semana_id, instrutor_id)",
         "ALTER TABLE horarios ADD COLUMN IF NOT EXISTS carga_horaria INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE instrutores ADD COLUMN IF NOT EXISTS codigo_acesso TEXT",
         "ALTER TABLE semanas ADD COLUMN IF NOT EXISTS limite_horas_instrutor INTEGER NOT NULL DEFAULT 10",
@@ -914,6 +952,25 @@ def obter_instrutor(instrutor_id: int) -> sqlite3.Row | None:
     return consultar_um("SELECT * FROM instrutores WHERE id = ?", (instrutor_id,))
 
 
+def finalizacao_do_instrutor(instrutor_id: int, semana_id: int):
+    return consultar_um(
+        "SELECT * FROM finalizacoes WHERE instrutor_id = ? AND semana_id = ?",
+        (instrutor_id, semana_id),
+    )
+
+
+def registrar_finalizacao(instrutor_id: int, semana_id: int) -> None:
+    executar("DELETE FROM finalizacoes WHERE instrutor_id = ? AND semana_id = ?", (instrutor_id, semana_id))
+    executar(
+        "INSERT INTO finalizacoes (instrutor_id, semana_id, finalizado_em) VALUES (?, ?, ?)",
+        (instrutor_id, semana_id, datetime.now().isoformat(timespec="minutes")),
+    )
+
+
+def limpar_finalizacao_instrutor(instrutor_id: int, semana_id: int) -> None:
+    executar("DELETE FROM finalizacoes WHERE instrutor_id = ? AND semana_id = ?", (instrutor_id, semana_id))
+
+
 def contar_ocupadas(horario_id: int) -> int:
     row = consultar_um(
         "SELECT COUNT(*) AS total FROM escolhas WHERE horario_id = ? AND status = 'Confirmada'",
@@ -1099,7 +1156,13 @@ def escolher_horario(instrutor_id: int, horario_id: int, origem_admin: bool = Fa
             """,
             (horario_id, instrutor_id),
         )
+        executar_em_transacao(
+            conn,
+            "DELETE FROM finalizacoes WHERE instrutor_id = ? AND semana_id = ?",
+            (instrutor_id, horario["semana_id"]),
+        )
         conn.commit()
+        limpar_cache_dados()
         return True, "Horário escolhido com sucesso."
     except DB_INTEGRITY_ERRORS as exc:
         conn.rollback()
@@ -1308,6 +1371,8 @@ def pagina_escolha_publica(token: str) -> None:
         st.error("Link inválido ou semana não encontrada.")
         return
 
+    semana_id = id_inteiro_seguro(semana["id"]) or 0
+
     st.subheader(semana["titulo"])
     st.write(f"**Período:** {br_date(semana['data_inicio'])} a {br_date(semana['data_fim'])}")
     st.write(f"**Status:** {semana['status']}")
@@ -1327,83 +1392,89 @@ def pagina_escolha_publica(token: str) -> None:
 
     st.divider()
     st.subheader("Identificação do instrutor")
+    st.caption("Selecione seu cadastro. Isso evita erro de digitação e mantém o quadro padronizado.")
 
-    with st.form("identificacao_instrutor"):
-        col1, col2, col3 = st.columns([1, 2, 1])
-        with col1:
-            posto_grad = st.text_input("Posto/Graduação", placeholder="Ex.: Sgt")
-        with col2:
-            nome = st.text_input("Nome de guerra ou nome completo *")
-        with col3:
-            matricula = st.text_input("Matrícula/Identificação *")
-        telefone = st.text_input("Telefone/WhatsApp", placeholder="Opcional")
-        codigo_acesso = st.text_input(
-            "Código de acesso",
-            type="password",
-            placeholder="Se foi informado pelo administrador",
-            help="Opcional. Se o instrutor já tiver código cadastrado, será necessário informá-lo para acessar.",
-        )
-        confirmar = st.form_submit_button("Continuar")
-
-    instrutor_id = st.session_state.get(f"instrutor_id_{token}")
-
-    if confirmar:
-        nome = nome.strip()
-        matricula = matricula.strip()
-        if not nome or not matricula:
-            st.error("Informe pelo menos o nome e a matrícula/identificação.")
-            return
-
-        existente = obter_instrutor_por_matricula(matricula)
-        codigo_digitado = codigo_acesso.strip()
-        if existente:
-            codigo_cadastrado = (existente["codigo_acesso"] or "").strip()
-            if codigo_cadastrado and codigo_digitado != codigo_cadastrado:
-                st.error("Código de acesso incorreto para esta matrícula.")
-                return
-            instrutor_id = id_inteiro_seguro(existente["id"])
-            if instrutor_id is None:
-                st.error("Não foi possível identificar o ID do instrutor no banco.")
-                return
-            executar(
-                """
-                UPDATE instrutores
-                SET nome = ?, posto_grad = ?, telefone = ?, ativo = 1
-                WHERE id = ?
-                """,
-                (nome, posto_grad.strip(), telefone.strip(), instrutor_id),
-            )
-        else:
-            instrutor_id = inserir_retornando_id(
-                """
-                INSERT INTO instrutores (nome, posto_grad, matricula, telefone, codigo_acesso, ativo)
-                VALUES (?, ?, ?, ?, ?, 1)
-                """,
-                (nome, posto_grad.strip(), matricula, telefone.strip(), codigo_digitado or None),
-            )
-
-        st.session_state[f"instrutor_id_{token}"] = instrutor_id
-        st.success("Identificação registrada. Agora escolha seus horários.")
-        st.rerun()
-
-    if not instrutor_id:
-        st.stop()
-
-    instrutor = obter_instrutor(id_inteiro_seguro(instrutor_id) or 0)
-    if not instrutor:
-        st.error("Instrutor não encontrado. Preencha a identificação novamente.")
+    instrutores = listar_instrutores(ativos=True)
+    if instrutores.empty:
+        st.error("Nenhum instrutor ativo foi cadastrado pelo administrador.")
         return
 
-    st.success(f"Instrutor identificado: {formatar_instrutor(instrutor)}")
+    chave_instrutor = f"instrutor_id_{token}"
+    instrutor_id = st.session_state.get(chave_instrutor)
+
+    if not instrutor_id:
+        opcoes_instrutores: dict[str, int | None] = {"Selecione seu nome...": None}
+        for _, row in instrutores.iterrows():
+            iid = id_inteiro_seguro(row_get(row, "id"))
+            if iid is None:
+                continue
+            matricula = str(row_get(row, "matricula", "") or "").strip()
+            sufixo = f" — Matrícula {matricula}" if matricula else f" — ID {iid}"
+            opcoes_instrutores[f"{formatar_instrutor(row)}{sufixo}"] = iid
+
+        with st.form("identificacao_instrutor_select"):
+            escolha_instrutor = st.selectbox(
+                "Quem é você? *",
+                list(opcoes_instrutores.keys()),
+                key=f"select_instrutor_publico_{token}",
+            )
+            codigo_acesso = st.text_input(
+                "Código de acesso",
+                type="password",
+                placeholder="Informe apenas se foi definido pelo administrador",
+                help="Se o seu cadastro tiver código de acesso, ele será obrigatório.",
+            )
+            confirmar = st.form_submit_button("Continuar")
+
+        if confirmar:
+            instrutor_id_escolhido = opcoes_instrutores.get(escolha_instrutor)
+            if not instrutor_id_escolhido:
+                st.error("Selecione seu nome para continuar.")
+                return
+
+            existente = obter_instrutor(instrutor_id_escolhido)
+            if not existente:
+                st.error("Cadastro de instrutor não encontrado. Procure o administrador.")
+                return
+
+            codigo_cadastrado = (existente["codigo_acesso"] or "").strip()
+            codigo_digitado = codigo_acesso.strip()
+            if codigo_cadastrado and codigo_digitado != codigo_cadastrado:
+                st.error("Código de acesso incorreto para este instrutor.")
+                return
+
+            st.session_state[chave_instrutor] = instrutor_id_escolhido
+            st.session_state.pop(f"finalizado_visual_{token}_{instrutor_id_escolhido}", None)
+            st.success("Identificação confirmada. Agora escolha seus horários.")
+            st.rerun()
+
+        st.info("Se seu nome não aparecer na lista, peça ao administrador para cadastrá-lo ou ativar seu cadastro.")
+        st.stop()
+
+    instrutor_id = id_inteiro_seguro(instrutor_id) or 0
+    instrutor = obter_instrutor(instrutor_id)
+    if not instrutor:
+        st.error("Instrutor não encontrado. Selecione sua identificação novamente.")
+        st.session_state.pop(chave_instrutor, None)
+        return
+
+    col_ident, col_trocar = st.columns([4, 1])
+    with col_ident:
+        st.success(f"Instrutor identificado: {formatar_instrutor(instrutor)}")
+    with col_trocar:
+        if st.button("Trocar instrutor", key=f"trocar_instrutor_{token}_{instrutor_id}"):
+            st.session_state.pop(chave_instrutor, None)
+            st.rerun()
+
     limite_semana = limite_horas_da_semana(semana)
-    carga_atual_publica = carga_instrutor_semana(id_inteiro_seguro(instrutor_id) or 0, id_inteiro_seguro(semana["id"]) or 0)
+    carga_atual_publica = carga_instrutor_semana(instrutor_id, semana_id)
     col_carga1, col_carga2 = st.columns(2)
     col_carga1.metric("Minha carga escolhida", f"{carga_atual_publica}h/a")
     col_carga2.metric("Limite da semana", "Sem limite" if limite_semana <= 0 else f"{limite_semana}h/a")
 
     st.divider()
     st.subheader("Meus horários escolhidos")
-    minhas = escolhas_do_instrutor(id_inteiro_seguro(instrutor_id) or 0, id_inteiro_seguro(semana["id"]) or 0)
+    minhas = escolhas_do_instrutor(instrutor_id, semana_id)
     if minhas.empty:
         st.caption("Você ainda não escolheu horários nesta semana.")
     else:
@@ -1417,6 +1488,19 @@ def pagina_escolha_publica(token: str) -> None:
             use_container_width=True,
             hide_index=True,
         )
+
+    finalizacao = finalizacao_do_instrutor(instrutor_id, semana_id)
+    if finalizacao:
+        st.success(
+            f"Processo finalizado em {formatar_data_hora_br(finalizacao['finalizado_em'])}. "
+            "Suas escolhas já foram registradas para esta semana."
+        )
+        if st.button("Voltar para ajustar minhas escolhas", key=f"ajustar_escolhas_{token}_{instrutor_id}"):
+            limpar_finalizacao_instrutor(instrutor_id, semana_id)
+            st.rerun()
+        return
+
+    if not minhas.empty:
         escolha_cancelar = st.selectbox(
             "Cancelar uma escolha",
             ["Não cancelar"]
@@ -1424,51 +1508,84 @@ def pagina_escolha_publica(token: str) -> None:
                 f"{row['escolha_id']} | {br_date(row['data_aula'])} {periodo_com_carga(row['hora_inicio'], row['hora_fim'], row.get('carga_horaria', 0))} - {descricao_aula(row['disciplina'])}"
                 for _, row in minhas.iterrows()
             ],
-            key=f"cancelar_escolha_{semana['id']}_{instrutor_id}",
+            key=f"cancelar_escolha_{semana_id}_{instrutor_id}",
         )
-        if escolha_cancelar != "Não cancelar" and st.button("Cancelar escolha selecionada"):
+        if escolha_cancelar != "Não cancelar" and st.button("Cancelar escolha selecionada", key=f"btn_cancelar_{semana_id}_{instrutor_id}"):
             escolha_id = numero_inteiro_seguro(escolha_cancelar.split("|")[0].strip(), 0)
-            executar("DELETE FROM escolhas WHERE id = ? AND instrutor_id = ?", (escolha_id, id_inteiro_seguro(instrutor_id) or 0))
+            executar("DELETE FROM escolhas WHERE id = ? AND instrutor_id = ?", (escolha_id, instrutor_id))
+            limpar_finalizacao_instrutor(instrutor_id, semana_id)
             st.success("Escolha cancelada.")
             st.rerun()
 
     st.divider()
     st.subheader("Horários disponíveis")
-    disponiveis = horarios_disponiveis(id_inteiro_seguro(semana["id"]) or 0)
+    st.caption("Os horários foram agrupados por dia para facilitar a escolha.")
+
+    disponiveis = horarios_disponiveis(semana_id)
     if disponiveis.empty:
         st.warning("Não há horários disponíveis no momento.")
-        return
+    else:
+        disponiveis = disponiveis.copy()
+        disponiveis["data_iso"] = disponiveis["data_aula"].apply(iso_date)
+        datas_disponiveis = [d for d in sorted(disponiveis["data_iso"].dropna().unique()) if d]
 
-    for _, row in disponiveis.iterrows():
-        with st.container(border=True):
-            col1, col2 = st.columns([4, 1])
-            with col1:
-                data_aula = data_para_date(row["data_aula"])
-                periodo = periodo_com_carga(row["hora_inicio"], row["hora_fim"], row.get("carga_horaria", 0))
-                dia_txt = DIAS_PT[data_aula.weekday()] if data_aula is not None else "Data não identificada"
-                st.markdown(f"**{dia_txt} - {br_date(row['data_aula'])} | {periodo}**")
-                st.write(f"**Descrição:** {descricao_aula(row['disciplina'])}")
-                detalhes = []
-                if row["local"]:
-                    detalhes.append(f"Local: {row['local']}")
-                if row["habilitacao"]:
-                    detalhes.append(f"Habilitação: {row['habilitacao']}")
-                detalhes.append(f"Vagas restantes: {numero_inteiro_seguro(row_get(row, 'vagas_restantes'), 0)}")
-                st.caption(" | ".join(detalhes))
-                if row["observacoes"]:
-                    st.caption(f"Observações: {row['observacoes']}")
-            with col2:
-                carga_nova = numero_inteiro_seguro(row_get(row, "carga_horaria"), 0)
-                excede_limite = limite_semana > 0 and carga_nova > 0 and (carga_atual_publica + carga_nova > limite_semana)
-                if excede_limite:
-                    st.caption("Ultrapassa seu limite semanal")
-                if st.button("Escolher", key=f"escolher_{row['horario_id']}", disabled=excede_limite):
-                    ok, msg = escolher_horario(id_inteiro_seguro(instrutor_id) or 0, id_inteiro_seguro(row_get(row, "horario_id")) or 0)
-                    if ok:
-                        st.success(msg)
-                    else:
-                        st.error(msg)
-                    st.rerun()
+        for idx, data_iso in enumerate(datas_disponiveis):
+            data_ok = data_para_date(data_iso)
+            dia_txt = DIAS_PT.get(data_ok.weekday(), "Dia") if data_ok else "Dia"
+            grupo = disponiveis[disponiveis["data_iso"] == data_iso].sort_values(["hora_inicio", "hora_fim"])
+            with st.expander(f"{dia_txt} - {br_date(data_iso)} • {len(grupo)} opção(ões)", expanded=(idx == 0)):
+                for _, row in grupo.iterrows():
+                    horario_id = id_inteiro_seguro(row_get(row, "horario_id")) or 0
+                    periodo = periodo_com_carga(row_get(row, "hora_inicio"), row_get(row, "hora_fim"), row_get(row, "carga_horaria", 0))
+                    descricao = descricao_aula(row_get(row, "disciplina", ""))
+                    vagas_restantes = numero_inteiro_seguro(row_get(row, "vagas_restantes"), 0)
+                    carga_nova = numero_inteiro_seguro(row_get(row, "carga_horaria"), 0)
+                    excede_limite = limite_semana > 0 and carga_nova > 0 and (carga_atual_publica + carga_nova > limite_semana)
+
+                    col1, col2, col3, col4 = st.columns([2, 3, 2, 1])
+                    with col1:
+                        st.markdown(f"**{periodo}**")
+                    with col2:
+                        st.write(descricao)
+                        detalhes = []
+                        if row_get(row, "local"):
+                            detalhes.append(f"Local: {row_get(row, 'local')}")
+                        if row_get(row, "habilitacao"):
+                            detalhes.append(f"Habilitação: {row_get(row, 'habilitacao')}")
+                        if row_get(row, "observacoes"):
+                            detalhes.append(f"Obs.: {row_get(row, 'observacoes')}")
+                        if detalhes:
+                            st.caption(" | ".join(detalhes))
+                    with col3:
+                        st.caption(f"Vagas restantes: {vagas_restantes}")
+                        if excede_limite:
+                            st.caption("Ultrapassa seu limite semanal")
+                    with col4:
+                        if st.button("Escolher", key=f"escolher_{token}_{horario_id}", disabled=excede_limite):
+                            ok, msg = escolher_horario(instrutor_id, horario_id)
+                            if ok:
+                                st.success(msg)
+                            else:
+                                st.error(msg)
+                            st.rerun()
+
+                    st.divider()
+
+    st.divider()
+    st.subheader("Finalizar")
+    st.write("Quando terminar, clique no botão abaixo para confirmar que suas escolhas estão concluídas.")
+    if st.button("Finalizar minhas escolhas", type="primary", key=f"finalizar_{token}_{instrutor_id}"):
+        minhas_atualizadas = escolhas_do_instrutor(instrutor_id, semana_id)
+        if minhas_atualizadas.empty:
+            st.warning("Escolha pelo menos um horário antes de finalizar.")
+        else:
+            registrar_finalizacao(instrutor_id, semana_id)
+            st.success("Pronto! Suas escolhas foram finalizadas e registradas com sucesso.")
+            try:
+                st.balloons()
+            except Exception:
+                pass
+            st.rerun()
 
 # =============================================================================
 # Páginas administrativas
