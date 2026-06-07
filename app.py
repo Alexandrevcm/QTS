@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Quadro Semanal de Instrutores - v1.3.5
+Quadro Semanal de Instrutores - v1.3.6
 
 Sistema web simples para:
 - cadastrar instrutores;
@@ -11,7 +11,8 @@ Sistema web simples para:
 - exportar Excel, PDF e texto para WhatsApp;
 - controlar limite semanal de h/a por instrutor;
 - permitir inclusão manual de escolhas pelo administrador;
-- publicar online com banco compartilhado PostgreSQL/Supabase quando configurado.
+- publicar online com banco compartilhado PostgreSQL/Supabase quando configurado;
+- corrigir leitura de tabelas do PostgreSQL sem linhas genéricas de nomes de colunas.
 
 Rodar localmente:
     streamlit run app.py
@@ -59,7 +60,7 @@ except Exception:
 
 
 APP_NAME = "Quadro Semanal de Instrutores"
-APP_VERSION = "1.3.5"
+APP_VERSION = "1.3.6"
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 DB_PATH = DATA_DIR / "quadro_instrutores.db"
@@ -351,7 +352,11 @@ def conectar():
                 "DATABASE_MODE está como PostgreSQL, mas DATABASE_URL/POSTGRES_URL não foi configurado nos secrets."
             )
         sslmode = str(segredo("POSTGRES_SSLMODE", "require") or "require")
-        conn = psycopg2.connect(url, cursor_factory=RealDictCursor, sslmode=sslmode)
+        # Importante: a conexão padrão NÃO deve usar RealDictCursor.
+        # O pandas.read_sql_query espera cursores que retornem tuplas; com RealDictCursor,
+        # os dataframes podem aparecer com valores genéricos iguais aos nomes das colunas
+        # (ex.: id, titulo, status), embora o banco esteja com os dados corretos.
+        conn = psycopg2.connect(url, sslmode=sslmode)
         conn.autocommit = False
         return conn
 
@@ -409,7 +414,9 @@ def consultar(sql: str, params: tuple[Any, ...] = ()) -> pd.DataFrame:
 def consultar_um(sql: str, params: tuple[Any, ...] = ()):
     conn = get_conn()
     if usando_postgres():
-        cur = conn.cursor()
+        # Para leituras de uma única linha, usamos RealDictCursor para manter acesso por nome:
+        # row["id"], row["titulo"], etc.
+        cur = conn.cursor(cursor_factory=RealDictCursor)
         cur.execute(sql_db(sql), params)
         return cur.fetchone()
     cur = conn.execute(sql, params)
@@ -418,7 +425,8 @@ def consultar_um(sql: str, params: tuple[Any, ...] = ()):
 
 def executar_em_transacao(conn, sql: str, params: tuple[Any, ...] = ()):
     if usando_postgres():
-        cur = conn.cursor()
+        # Nas transações de escolha, o código lê linhas por nome de coluna.
+        cur = conn.cursor(cursor_factory=RealDictCursor)
         cur.execute(sql_db(sql), params)
         return cur
     return conn.execute(sql, params)
