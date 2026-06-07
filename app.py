@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Quadro Semanal de Instrutores - v1.3.4
+Quadro Semanal de Instrutores - v1.3.5
 
 Sistema web simples para:
 - cadastrar instrutores;
@@ -59,7 +59,7 @@ except Exception:
 
 
 APP_NAME = "Quadro Semanal de Instrutores"
-APP_VERSION = "1.3.4"
+APP_VERSION = "1.3.5"
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 DB_PATH = DATA_DIR / "quadro_instrutores.db"
@@ -199,6 +199,88 @@ def serie_formatar_limite_ha(serie: pd.Series) -> pd.Series:
     return serie.apply(formatar_limite_ha_valor)
 
 
+def id_inteiro_seguro(valor: Any) -> int | None:
+    """Converte IDs vindos do SQLite/PostgreSQL/Pandas para int; retorna None se inválido."""
+    if valor is None:
+        return None
+    try:
+        if pd.isna(valor):
+            return None
+    except Exception:
+        pass
+
+    texto = str(valor).strip()
+    if not texto or texto.lower() in {"none", "nan", "nat", "null", "—", "-"}:
+        return None
+    try:
+        return int(float(texto.replace(",", ".")))
+    except Exception:
+        return None
+
+
+def row_get(row: Any, chave: str, padrao: Any = None) -> Any:
+    """Lê valor de dict/Series/Row sem derrubar se a chave não existir."""
+    try:
+        if hasattr(row, "get"):
+            return row.get(chave, padrao)
+        return row[chave]
+    except Exception:
+        return padrao
+
+
+def data_hora_para_datetime(valor: Any) -> datetime | None:
+    """Converte data/hora de SQLite/PostgreSQL para datetime sem derrubar o app."""
+    if valor is None:
+        return None
+    try:
+        if pd.isna(valor):
+            return None
+    except Exception:
+        pass
+    if isinstance(valor, datetime):
+        return valor
+    if isinstance(valor, date):
+        return datetime.combine(valor, time.min)
+    texto = str(valor).strip()
+    if not texto or texto.lower() in {"none", "nan", "nat", "null", "—", "-"}:
+        return None
+
+    texto_sem_z = texto.replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(texto_sem_z)
+    except Exception:
+        pass
+
+    formatos = (
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%d/%m/%Y %H:%M:%S",
+        "%d/%m/%Y %H:%M",
+        "%Y-%m-%d",
+        "%d/%m/%Y",
+    )
+    for formato in formatos:
+        try:
+            return datetime.strptime(texto[:19], formato)
+        except Exception:
+            pass
+    try:
+        ts = pd.to_datetime(texto, errors="coerce", dayfirst=True)
+        if pd.isna(ts):
+            return None
+        return ts.to_pydatetime()
+    except Exception:
+        return None
+
+
+def formatar_data_hora_br(valor: Any) -> str:
+    dt = data_hora_para_datetime(valor)
+    if dt is None:
+        return "—"
+    return dt.strftime("%d/%m/%Y %H:%M")
+
 
 # =============================================================================
 # Banco de dados
@@ -307,9 +389,16 @@ def inserir_retornando_id(sql: str, params: tuple[Any, ...] = ()) -> int:
         sql_limpo = sql.strip().rstrip(";")
         cur = executar(sql_limpo + " RETURNING id", params)
         row = cur.fetchone()
-        return int(row["id"] if isinstance(row, dict) else row[0])
+        valor_id = row["id"] if isinstance(row, dict) else row[0]
+        novo_id = id_inteiro_seguro(valor_id)
+        if novo_id is None:
+            raise ValueError(f"Não foi possível obter o ID gerado pelo banco: {valor_id!r}")
+        return novo_id
     cur = executar(sql, params)
-    return int(cur.lastrowid)
+    novo_id = id_inteiro_seguro(cur.lastrowid)
+    if novo_id is None:
+        raise ValueError("Não foi possível obter o ID gerado pelo SQLite.")
+    return novo_id
 
 
 def consultar(sql: str, params: tuple[Any, ...] = ()) -> pd.DataFrame:
@@ -812,7 +901,7 @@ def contar_ocupadas(horario_id: int) -> int:
         "SELECT COUNT(*) AS total FROM escolhas WHERE horario_id = ? AND status = 'Confirmada'",
         (horario_id,),
     )
-    return int(row["total"] if row else 0)
+    return numero_inteiro_seguro(row["total"] if row else 0, 0)
 
 
 def carga_instrutor_semana(instrutor_id: int, semana_id: int) -> int:
@@ -827,7 +916,7 @@ def carga_instrutor_semana(instrutor_id: int, semana_id: int) -> int:
         """,
         (instrutor_id, semana_id),
     )
-    return int(row["total"] if row and row["total"] is not None else 0)
+    return numero_inteiro_seguro(row["total"] if row and row["total"] is not None else 0, 0)
 
 
 def carga_por_instrutor_semana(semana_id: int) -> pd.DataFrame:
@@ -897,7 +986,7 @@ def escolher_horario(instrutor_id: int, horario_id: int, origem_admin: bool = Fa
         if not horario:
             conn.rollback()
             return False, "Horário não encontrado."
-        if int(horario["bloqueado"]) == 1:
+        if numero_inteiro_seguro(horario["bloqueado"], 0) == 1:
             conn.rollback()
             return False, "Este horário está bloqueado pelo administrador."
 
@@ -910,8 +999,8 @@ def escolher_horario(instrutor_id: int, horario_id: int, origem_admin: bool = Fa
             return False, "A semana não está aberta para escolhas."
 
         if semana["prazo_escolha"] and not origem_admin:
-            prazo = datetime.fromisoformat(str(semana["prazo_escolha"]))
-            if datetime.now() > prazo:
+            prazo = data_hora_para_datetime(semana["prazo_escolha"])
+            if prazo is not None and datetime.now() > prazo:
                 conn.rollback()
                 return False, "O prazo de escolha já terminou."
 
@@ -921,7 +1010,7 @@ def escolher_horario(instrutor_id: int, horario_id: int, origem_admin: bool = Fa
             (horario_id,),
         ).fetchone()
         ocupadas = ocupadas_row["total"] if ocupadas_row else 0
-        if int(ocupadas) >= int(horario["vagas"]):
+        if numero_inteiro_seguro(ocupadas, 0) >= numero_inteiro_seguro(horario["vagas"], 0):
             conn.rollback()
             return False, "As vagas desse horário acabaram."
 
@@ -1146,8 +1235,15 @@ def selecionar_semana(label: str = "Semana", key: str | None = None) -> int | No
 
     opcoes = {}
     for _, row in semanas.iterrows():
-        nome = f"{row['titulo']} — {br_date(row['data_inicio'])} a {br_date(row['data_fim'])} — {row['status']}"
-        opcoes[nome] = int(row["id"])
+        semana_id = id_inteiro_seguro(row_get(row, "id"))
+        if semana_id is None:
+            continue
+        nome = f"{row_get(row, 'titulo', 'Semana sem título')} — {br_date(row_get(row, 'data_inicio'))} a {br_date(row_get(row, 'data_fim'))} — {row_get(row, 'status', '')}"
+        opcoes[nome] = semana_id
+
+    if not opcoes:
+        st.warning("Nenhuma semana válida foi encontrada no banco. Verifique se a tabela de semanas tem IDs válidos.")
+        return None
 
     if key is None:
         frame = inspect.currentframe()
@@ -1198,7 +1294,7 @@ def pagina_escolha_publica(token: str) -> None:
     st.write(f"**Período:** {br_date(semana['data_inicio'])} a {br_date(semana['data_fim'])}")
     st.write(f"**Status:** {semana['status']}")
     if semana["prazo_escolha"]:
-        st.write(f"**Prazo para escolha:** {datetime.fromisoformat(semana['prazo_escolha']).strftime('%d/%m/%Y %H:%M')}")
+        st.write(f"**Prazo para escolha:** {formatar_data_hora_br(semana['prazo_escolha'])}")
     if semana["observacoes"]:
         st.info(semana["observacoes"])
 
@@ -1206,7 +1302,8 @@ def pagina_escolha_publica(token: str) -> None:
         st.warning("Esta semana não está aberta para novas escolhas.")
         st.stop()
 
-    if semana["prazo_escolha"] and datetime.now() > datetime.fromisoformat(semana["prazo_escolha"]):
+    prazo_publico = data_hora_para_datetime(semana["prazo_escolha"])
+    if semana["prazo_escolha"] and prazo_publico is not None and datetime.now() > prazo_publico:
         st.warning("O prazo para escolha terminou.")
         st.stop()
 
@@ -1246,7 +1343,10 @@ def pagina_escolha_publica(token: str) -> None:
             if codigo_cadastrado and codigo_digitado != codigo_cadastrado:
                 st.error("Código de acesso incorreto para esta matrícula.")
                 return
-            instrutor_id = int(existente["id"])
+            instrutor_id = id_inteiro_seguro(existente["id"])
+            if instrutor_id is None:
+                st.error("Não foi possível identificar o ID do instrutor no banco.")
+                return
             executar(
                 """
                 UPDATE instrutores
@@ -1271,21 +1371,21 @@ def pagina_escolha_publica(token: str) -> None:
     if not instrutor_id:
         st.stop()
 
-    instrutor = obter_instrutor(int(instrutor_id))
+    instrutor = obter_instrutor(id_inteiro_seguro(instrutor_id) or 0)
     if not instrutor:
         st.error("Instrutor não encontrado. Preencha a identificação novamente.")
         return
 
     st.success(f"Instrutor identificado: {formatar_instrutor(instrutor)}")
     limite_semana = limite_horas_da_semana(semana)
-    carga_atual_publica = carga_instrutor_semana(int(instrutor_id), int(semana["id"]))
+    carga_atual_publica = carga_instrutor_semana(id_inteiro_seguro(instrutor_id) or 0, id_inteiro_seguro(semana["id"]) or 0)
     col_carga1, col_carga2 = st.columns(2)
     col_carga1.metric("Minha carga escolhida", f"{carga_atual_publica}h/a")
     col_carga2.metric("Limite da semana", "Sem limite" if limite_semana <= 0 else f"{limite_semana}h/a")
 
     st.divider()
     st.subheader("Meus horários escolhidos")
-    minhas = escolhas_do_instrutor(int(instrutor_id), int(semana["id"]))
+    minhas = escolhas_do_instrutor(id_inteiro_seguro(instrutor_id) or 0, id_inteiro_seguro(semana["id"]) or 0)
     if minhas.empty:
         st.caption("Você ainda não escolheu horários nesta semana.")
     else:
@@ -1309,14 +1409,14 @@ def pagina_escolha_publica(token: str) -> None:
             key=f"cancelar_escolha_{semana['id']}_{instrutor_id}",
         )
         if escolha_cancelar != "Não cancelar" and st.button("Cancelar escolha selecionada"):
-            escolha_id = int(escolha_cancelar.split("|")[0].strip())
-            executar("DELETE FROM escolhas WHERE id = ? AND instrutor_id = ?", (escolha_id, int(instrutor_id)))
+            escolha_id = numero_inteiro_seguro(escolha_cancelar.split("|")[0].strip(), 0)
+            executar("DELETE FROM escolhas WHERE id = ? AND instrutor_id = ?", (escolha_id, id_inteiro_seguro(instrutor_id) or 0))
             st.success("Escolha cancelada.")
             st.rerun()
 
     st.divider()
     st.subheader("Horários disponíveis")
-    disponiveis = horarios_disponiveis(int(semana["id"]))
+    disponiveis = horarios_disponiveis(id_inteiro_seguro(semana["id"]) or 0)
     if disponiveis.empty:
         st.warning("Não há horários disponíveis no momento.")
         return
@@ -1335,17 +1435,17 @@ def pagina_escolha_publica(token: str) -> None:
                     detalhes.append(f"Local: {row['local']}")
                 if row["habilitacao"]:
                     detalhes.append(f"Habilitação: {row['habilitacao']}")
-                detalhes.append(f"Vagas restantes: {int(row['vagas_restantes'])}")
+                detalhes.append(f"Vagas restantes: {numero_inteiro_seguro(row_get(row, 'vagas_restantes'), 0)}")
                 st.caption(" | ".join(detalhes))
                 if row["observacoes"]:
                     st.caption(f"Observações: {row['observacoes']}")
             with col2:
-                carga_nova = int(row.get("carga_horaria", 0) or 0)
+                carga_nova = numero_inteiro_seguro(row_get(row, "carga_horaria"), 0)
                 excede_limite = limite_semana > 0 and carga_nova > 0 and (carga_atual_publica + carga_nova > limite_semana)
                 if excede_limite:
                     st.caption("Ultrapassa seu limite semanal")
                 if st.button("Escolher", key=f"escolher_{row['horario_id']}", disabled=excede_limite):
-                    ok, msg = escolher_horario(int(instrutor_id), int(row["horario_id"]))
+                    ok, msg = escolher_horario(id_inteiro_seguro(instrutor_id) or 0, id_inteiro_seguro(row_get(row, "horario_id")) or 0)
                     if ok:
                         st.success(msg)
                     else:
@@ -1442,10 +1542,10 @@ Depois de configurar, reinicie/redeploy o app no Streamlit Cloud.
         qtd_escolhas = consultar_um("SELECT COUNT(*) AS total FROM escolhas")
         st.write("**Resumo do banco atual:**")
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Instrutores", int(qtd_instrutores["total"]))
-        c2.metric("Semanas", int(qtd_semanas["total"]))
-        c3.metric("Horários", int(qtd_horarios["total"]))
-        c4.metric("Escolhas", int(qtd_escolhas["total"]))
+        c1.metric("Instrutores", numero_inteiro_seguro(qtd_instrutores["total"], 0))
+        c2.metric("Semanas", numero_inteiro_seguro(qtd_semanas["total"], 0))
+        c3.metric("Horários", numero_inteiro_seguro(qtd_horarios["total"], 0))
+        c4.metric("Escolhas", numero_inteiro_seguro(qtd_escolhas["total"], 0))
     except Exception as exc:
         st.error(f"Não foi possível consultar o banco atual: {exc}")
 
@@ -1613,7 +1713,15 @@ def aba_instrutores() -> None:
     )
 
     st.subheader("Editar instrutor")
-    opcoes = {f"{row['id']} - {formatar_instrutor(row)}": int(row["id"]) for _, row in instrutores.iterrows()}
+    opcoes = {}
+    for _, row in instrutores.iterrows():
+        instrutor_id_item = id_inteiro_seguro(row_get(row, "id"))
+        if instrutor_id_item is None:
+            continue
+        opcoes[f"{instrutor_id_item} - {formatar_instrutor(row)}"] = instrutor_id_item
+    if not opcoes:
+        st.warning("Nenhum instrutor com ID válido foi encontrado.")
+        return
     escolha = st.selectbox("Instrutor", list(opcoes.keys()), key="editar_instrutor_select")
     instrutor_id = opcoes[escolha]
     row = obter_instrutor(instrutor_id)
@@ -1795,10 +1903,16 @@ def aba_horarios() -> None:
     st.dataframe(quadro_view, use_container_width=True, hide_index=True)
 
     st.subheader("Editar, bloquear, liberar ou excluir horário")
-    opcoes = {
-        f"{row['horario_id']} | {br_date(row['data_aula'])} {periodo_com_carga(row['hora_inicio'], row['hora_fim'], row.get('carga_horaria', 0))} - {descricao_aula(row['disciplina'])}": int(row["horario_id"])
-        for _, row in quadro.iterrows()
-    }
+    opcoes = {}
+    for _, row in quadro.iterrows():
+        horario_id_item = id_inteiro_seguro(row_get(row, "horario_id"))
+        if horario_id_item is None:
+            continue
+        label_horario = f"{horario_id_item} | {br_date(row_get(row, 'data_aula'))} {periodo_com_carga(row_get(row, 'hora_inicio'), row_get(row, 'hora_fim'), row_get(row, 'carga_horaria', 0))} - {descricao_aula(row_get(row, 'disciplina', ''))}"
+        opcoes[label_horario] = horario_id_item
+    if not opcoes:
+        st.warning("Nenhum horário com ID válido foi encontrado.")
+        return
     escolha = st.selectbox("Horário", list(opcoes.keys()), key=f"editar_horario_{semana_id}")
     horario_id = opcoes[escolha]
     horario = consultar_um("SELECT * FROM horarios WHERE id = ?", (horario_id,))
@@ -1808,9 +1922,9 @@ def aba_horarios() -> None:
             with col1:
                 novo_bloqueado = st.checkbox("Bloqueado", value=bool(horario["bloqueado"]))
             with col2:
-                novas_vagas = st.number_input("Vagas", min_value=1, max_value=20, value=int(horario["vagas"]), step=1)
+                novas_vagas = st.number_input("Vagas", min_value=1, max_value=20, value=max(1, numero_inteiro_seguro(horario["vagas"], 1)), step=1)
             with col3:
-                nova_carga = st.number_input("Carga h/a", min_value=0, max_value=12, value=int(horario["carga_horaria"] or 0), step=1)
+                nova_carga = st.number_input("Carga h/a", min_value=0, max_value=12, value=numero_inteiro_seguro(horario["carga_horaria"], 0), step=1)
             nova_descricao = st.text_input("Descrição/atividade", value=horario["disciplina"] or "")
             col4, col5 = st.columns(2)
             with col4:
@@ -1910,11 +2024,30 @@ def aba_escolhas() -> None:
     elif instrutores.empty:
         st.warning("Cadastre instrutores ativos antes de adicionar escolhas manualmente.")
     else:
-        opcoes_h = {
-            f"{row['horario_id']} | {br_date(row['data_aula'])} {periodo_com_carga(row['hora_inicio'], row['hora_fim'], row.get('carga_horaria', 0))} - {descricao_aula(row['disciplina'])} - vagas {int(row['ocupadas'])}/{int(row['vagas'])}": int(row["horario_id"])
-            for _, row in quadro.iterrows()
-        }
-        opcoes_i = {f"{row['id']} | {formatar_instrutor(row)} - {row['matricula'] or 'sem matrícula'}": int(row["id"]) for _, row in instrutores.iterrows()}
+        opcoes_h = {}
+        for _, row in quadro.iterrows():
+            horario_id_item = id_inteiro_seguro(row_get(row, "horario_id"))
+            if horario_id_item is None:
+                continue
+            label_horario = (
+                f"{horario_id_item} | {br_date(row_get(row, 'data_aula'))} "
+                f"{periodo_com_carga(row_get(row, 'hora_inicio'), row_get(row, 'hora_fim'), row_get(row, 'carga_horaria', 0))} - "
+                f"{descricao_aula(row_get(row, 'disciplina', ''))} - vagas "
+                f"{numero_inteiro_seguro(row_get(row, 'ocupadas'), 0)}/{numero_inteiro_seguro(row_get(row, 'vagas'), 0)}"
+            )
+            opcoes_h[label_horario] = horario_id_item
+
+        opcoes_i = {}
+        for _, row in instrutores.iterrows():
+            instrutor_id_item = id_inteiro_seguro(row_get(row, "id"))
+            if instrutor_id_item is None:
+                continue
+            opcoes_i[f"{instrutor_id_item} | {formatar_instrutor(row)} - {row_get(row, 'matricula') or 'sem matrícula'}"] = instrutor_id_item
+
+        if not opcoes_h or not opcoes_i:
+            st.warning("Não há horários ou instrutores com ID válido para inclusão manual.")
+            return
+
         with st.form("adicionar_escolha_admin"):
             horario_label = st.selectbox("Horário", list(opcoes_h.keys()), key=f"admin_adicionar_horario_{semana_id}")
             instrutor_label = st.selectbox("Instrutor", list(opcoes_i.keys()), key=f"admin_adicionar_instrutor_{semana_id}")
@@ -1930,10 +2063,16 @@ def aba_escolhas() -> None:
     if not df.empty:
         st.divider()
         st.subheader("Remover escolha manualmente")
-        opcoes = {
-            f"{row['escolha_id']} | {br_date(row['data_aula'])} {periodo_com_carga(row['hora_inicio'], row['hora_fim'], row.get('carga_horaria', 0))} - {row['instrutor']} - {descricao_aula(row['disciplina'])}": int(row["escolha_id"])
-            for _, row in df.iterrows()
-        }
+        opcoes = {}
+        for _, row in df.iterrows():
+            escolha_id_item = id_inteiro_seguro(row_get(row, "escolha_id"))
+            if escolha_id_item is None:
+                continue
+            label_escolha = f"{escolha_id_item} | {br_date(row_get(row, 'data_aula'))} {periodo_com_carga(row_get(row, 'hora_inicio'), row_get(row, 'hora_fim'), row_get(row, 'carga_horaria', 0))} - {row_get(row, 'instrutor', '')} - {descricao_aula(row_get(row, 'disciplina', ''))}"
+            opcoes[label_escolha] = escolha_id_item
+        if not opcoes:
+            st.warning("Nenhuma escolha com ID válido foi encontrada para remoção.")
+            return
         escolha = st.selectbox("Escolha", list(opcoes.keys()), key=f"remover_escolha_{semana_id}")
         if st.button("Remover escolha selecionada"):
             executar("DELETE FROM escolhas WHERE id = ?", (opcoes[escolha],))
@@ -1954,10 +2093,10 @@ def aba_quadro_final() -> None:
         return
 
     total_horarios = len(quadro)
-    vagas_total = int(quadro["vagas"].sum())
-    vagas_ocupadas = int(quadro["ocupadas"].sum())
+    vagas_total = numero_inteiro_seguro(quadro["vagas"].sum(), 0)
+    vagas_ocupadas = numero_inteiro_seguro(quadro["ocupadas"].sum(), 0)
     pendentes = vagas_total - vagas_ocupadas
-    carga_total = int((quadro["carga_horaria"].fillna(0) * quadro["vagas"].fillna(0)).sum())
+    carga_total = numero_inteiro_seguro((pd.to_numeric(quadro["carga_horaria"], errors="coerce").fillna(0) * pd.to_numeric(quadro["vagas"], errors="coerce").fillna(0)).sum(), 0)
 
     col1, col2, col3, col4, col5 = st.columns(5)
     col1.metric("Horários", total_horarios)
@@ -2041,7 +2180,7 @@ def aba_link_publico() -> None:
         f"Período: {br_date(semana['data_inicio'])} a {br_date(semana['data_fim'])}\n"
     )
     if semana["prazo_escolha"]:
-        mensagem += f"Prazo: {datetime.fromisoformat(semana['prazo_escolha']).strftime('%d/%m/%Y %H:%M')}\n"
+        mensagem += f"Prazo: {formatar_data_hora_br(semana['prazo_escolha'])}\n"
     mensagem += f"\n{link}"
     st.text_area("Mensagem", value=mensagem, height=180)
 
