@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Quadro Semanal de Instrutores - v1.3.2
+Quadro Semanal de Instrutores - v1.3.3
 
 Sistema web simples para:
 - cadastrar instrutores;
@@ -59,7 +59,7 @@ except Exception:
 
 
 APP_NAME = "Quadro Semanal de Instrutores"
-APP_VERSION = "1.3.2"
+APP_VERSION = "1.3.3"
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 DB_PATH = DATA_DIR / "quadro_instrutores.db"
@@ -151,8 +151,41 @@ def serie_formatar_data_br(serie: pd.Series) -> pd.Series:
     return serie.apply(formatar_data_br_valor)
 
 
-def serie_dia_semana_pt(serie: pd.Series) -> pd.Series:
-    return serie.apply(dia_semana_pt_valor)
+def numero_inteiro_seguro(valor: Any, padrao: int = 0) -> int:
+    """Converte valores vindos do SQLite/PostgreSQL/Pandas para inteiro sem derrubar o app."""
+    if valor is None:
+        return padrao
+    try:
+        if pd.isna(valor):
+            return padrao
+    except Exception:
+        pass
+
+    texto = str(valor).strip().lower()
+    if not texto or texto in {"none", "nan", "nat", "null", "—", "-"}:
+        return padrao
+
+    texto = (
+        texto.replace("h/a", "")
+        .replace("ha", "")
+        .replace("horas", "")
+        .replace("hora", "")
+        .replace(",", ".")
+        .strip()
+    )
+
+    try:
+        return int(float(texto))
+    except Exception:
+        return padrao
+
+
+def formatar_limite_ha_valor(valor: Any) -> str:
+    return f"{numero_inteiro_seguro(valor, 0)}h/a"
+
+
+def serie_formatar_limite_ha(serie: pd.Series) -> pd.Series:
+    return serie.apply(formatar_limite_ha_valor)
 
 
 
@@ -808,7 +841,7 @@ def carga_por_instrutor_semana(semana_id: int) -> pd.DataFrame:
 
 def limite_horas_da_semana(semana: sqlite3.Row | dict[str, Any] | pd.Series) -> int:
     try:
-        return int(semana["limite_horas_instrutor"] or 0)
+        return numero_inteiro_seguro(semana["limite_horas_instrutor"], 0)
     except Exception:
         return 0
 
@@ -892,8 +925,8 @@ def escolher_horario(instrutor_id: int, horario_id: int, origem_admin: bool = Fa
             conn.rollback()
             return False, "Você já escolheu esse horário."
 
-        limite = int(semana["limite_horas_instrutor"] or 0)
-        carga_nova = int(horario["carga_horaria"] or 0)
+        limite = numero_inteiro_seguro(semana["limite_horas_instrutor"], 0)
+        carga_nova = numero_inteiro_seguro(horario["carga_horaria"], 0)
         if limite > 0 and carga_nova > 0:
             carga_row = executar_em_transacao(
                 conn,
@@ -908,11 +941,12 @@ def escolher_horario(instrutor_id: int, horario_id: int, origem_admin: bool = Fa
                 (instrutor_id, horario["semana_id"]),
             ).fetchone()
             carga_atual = carga_row["total"] if carga_row else 0
-            if int(carga_atual or 0) + carga_nova > limite:
+            carga_atual_int = numero_inteiro_seguro(carga_atual, 0)
+            if carga_atual_int + carga_nova > limite:
                 conn.rollback()
                 return (
                     False,
-                    f"Limite semanal ultrapassado. Você já possui {int(carga_atual or 0)}h/a; "
+                    f"Limite semanal ultrapassado. Você já possui {carga_atual_int}h/a; "
                     f"este horário tem {carga_nova}h/a; limite da semana: {limite}h/a."
                 )
 
@@ -1444,7 +1478,7 @@ def aba_semanas() -> None:
         semanas.assign(
             Início=lambda d: serie_formatar_data_br(d["data_inicio"]),
             Fim=lambda d: serie_formatar_data_br(d["data_fim"]),
-            Limite=lambda d: d["limite_horas_instrutor"].fillna(0).astype(int).astype(str) + "h/a",
+            Limite=lambda d: serie_formatar_limite_ha(d["limite_horas_instrutor"]),
         )[["id", "titulo", "Início", "Fim", "status", "Limite", "token", "observacoes"]].rename(
             columns={"id": "ID", "titulo": "Título", "status": "Status", "token": "Token", "observacoes": "Observações"}
         ),
