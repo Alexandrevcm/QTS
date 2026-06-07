@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Quadro Semanal de Instrutores - v1.3.6
+Quadro Semanal de Instrutores - v1.3.7
 
 Sistema web simples para:
 - cadastrar instrutores;
@@ -12,7 +12,8 @@ Sistema web simples para:
 - controlar limite semanal de h/a por instrutor;
 - permitir inclusão manual de escolhas pelo administrador;
 - publicar online com banco compartilhado PostgreSQL/Supabase quando configurado;
-- corrigir leitura de tabelas do PostgreSQL sem linhas genéricas de nomes de colunas.
+- corrigir leitura de tabelas do PostgreSQL sem linhas genéricas de nomes de colunas;
+- corrigir geração/visualização da grade padrão no PostgreSQL/Streamlit Cloud.
 
 Rodar localmente:
     streamlit run app.py
@@ -60,7 +61,7 @@ except Exception:
 
 
 APP_NAME = "Quadro Semanal de Instrutores"
-APP_VERSION = "1.3.6"
+APP_VERSION = "1.3.7"
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 DB_PATH = DATA_DIR / "quadro_instrutores.db"
@@ -161,6 +162,15 @@ def dia_semana_pt_valor(valor: Any) -> str:
 
 def serie_formatar_data_br(serie: pd.Series) -> pd.Series:
     return serie.apply(formatar_data_br_valor)
+
+
+def serie_dia_semana_pt(serie: pd.Series) -> pd.Series:
+    """Retorna o dia da semana em português para uma série de datas.
+
+    Esta função é usada na montagem do quadro final e precisa aceitar datas vindas
+    tanto do SQLite quanto do PostgreSQL/Supabase.
+    """
+    return serie.apply(dia_semana_pt_valor)
 
 
 def numero_inteiro_seguro(valor: Any, padrao: int = 0) -> int:
