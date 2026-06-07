@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Quadro Semanal de Instrutores - v1.3.8
+Quadro Semanal de Instrutores - v1.3.9
 
 Sistema web simples para:
 - cadastrar instrutores;
@@ -14,7 +14,9 @@ Sistema web simples para:
 - publicar online com banco compartilhado PostgreSQL/Supabase quando configurado;
 - corrigir leitura de tabelas do PostgreSQL sem linhas genéricas de nomes de colunas;
 - corrigir geração/visualização da grade padrão no PostgreSQL/Streamlit Cloud;
-- adicionar cache de consultas, identificação por seleção e finalização do instrutor.
+- adicionar cache de consultas, identificação por seleção e finalização do instrutor;
+- permitir exclusão segura de instrutores;
+- melhorar a interface administrativa com menu lateral e visual de app.
 
 Rodar localmente:
     streamlit run app.py
@@ -61,8 +63,8 @@ except Exception:
     REPORTLAB_DISPONIVEL = False
 
 
-APP_NAME = "Quadro de Trabalho Semanal"
-APP_VERSION = "1.3.8"
+APP_NAME = "Quadro Semanal de Instrutores"
+APP_VERSION = "1.3.9"
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 DB_PATH = DATA_DIR / "quadro_instrutores.db"
@@ -87,6 +89,128 @@ DIAS_PT = {
 }
 
 STATUS_SEMANA = ["Aberta", "Encerrada", "Publicada"]
+
+
+# =============================================================================
+# Aparência geral
+# =============================================================================
+
+
+def aplicar_estilo() -> None:
+    """Aplica um visual mais próximo de app/sistema e menos parecido com planilha."""
+    st.markdown(
+        """
+        <style>
+            :root {
+                --qts-bg-card: #ffffff;
+                --qts-bg-soft: #f6f8fb;
+                --qts-border: #e7eaf0;
+                --qts-primary: #1f6feb;
+                --qts-text-muted: #64748b;
+            }
+
+            .block-container {
+                padding-top: 1.35rem;
+                padding-bottom: 2rem;
+                max-width: 1180px;
+            }
+
+            h1 {
+                letter-spacing: -0.03em;
+                margin-bottom: 0.2rem;
+            }
+
+            h2, h3 {
+                letter-spacing: -0.02em;
+            }
+
+            [data-testid="stSidebar"] {
+                background: linear-gradient(180deg, #0f172a 0%, #111827 100%);
+            }
+
+            [data-testid="stSidebar"] * {
+                color: #f8fafc !important;
+            }
+
+            [data-testid="stSidebar"] .stRadio label {
+                color: #f8fafc !important;
+            }
+
+            [data-testid="stMetric"] {
+                background: var(--qts-bg-card);
+                border: 1px solid var(--qts-border);
+                border-radius: 16px;
+                padding: 1rem 1rem;
+                box-shadow: 0 8px 24px rgba(15, 23, 42, 0.06);
+            }
+
+            div[data-testid="stDataFrame"] {
+                border: 1px solid var(--qts-border);
+                border-radius: 16px;
+                overflow: hidden;
+                box-shadow: 0 8px 24px rgba(15, 23, 42, 0.04);
+            }
+
+            div[data-testid="stExpander"] {
+                border: 1px solid var(--qts-border);
+                border-radius: 16px;
+                overflow: hidden;
+                background: var(--qts-bg-card);
+                box-shadow: 0 8px 24px rgba(15, 23, 42, 0.04);
+            }
+
+            .qts-card {
+                background: var(--qts-bg-card);
+                border: 1px solid var(--qts-border);
+                border-radius: 18px;
+                padding: 1rem 1.1rem;
+                box-shadow: 0 8px 24px rgba(15, 23, 42, 0.06);
+                margin: 0.75rem 0 1rem 0;
+            }
+
+            .qts-muted {
+                color: var(--qts-text-muted);
+                font-size: 0.92rem;
+            }
+
+            .qts-kicker {
+                display: inline-block;
+                background: #eef6ff;
+                color: #1d4ed8;
+                border: 1px solid #dbeafe;
+                border-radius: 999px;
+                padding: 0.2rem 0.7rem;
+                font-size: 0.82rem;
+                font-weight: 700;
+                margin-bottom: 0.4rem;
+            }
+
+            .stButton > button, .stDownloadButton > button, button[kind="primary"] {
+                border-radius: 12px !important;
+                font-weight: 650 !important;
+            }
+
+            input, textarea, [data-baseweb="select"] > div {
+                border-radius: 12px !important;
+            }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def card_html(titulo: str, texto: str = "", kicker: str = "") -> None:
+    """Bloco visual simples para orientar o usuário sem poluir a tela."""
+    st.markdown(
+        f"""
+        <div class="qts-card">
+            {'<div class="qts-kicker">' + kicker + '</div>' if kicker else ''}
+            <div style="font-size:1.08rem;font-weight:750;margin-bottom:0.25rem;">{titulo}</div>
+            {f'<div class="qts-muted">{texto}</div>' if texto else ''}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def data_para_timestamp(valor: Any) -> pd.Timestamp:
@@ -1343,7 +1467,7 @@ def formulario_login_admin() -> bool:
         return True
 
     st.subheader("Acesso administrativo")
-    st.info("Digite a senha de administrador.")
+    st.info("Senha padrão inicial: admin123. Altere no arquivo `.streamlit/secrets.toml` antes de publicar o app.")
     with st.form("login_admin"):
         senha = st.text_input("Senha", type="password")
         entrar = st.form_submit_button("Entrar")
@@ -1598,43 +1722,50 @@ def pagina_admin() -> None:
         return
 
     with st.sidebar:
+        st.markdown("### 📋 QTS Instrutores")
+        st.caption(f"Versão {APP_VERSION}")
         st.success("Administrador logado")
-        if st.button("Sair"):
+        if st.button("Sair", use_container_width=True):
             st.session_state["admin_logado"] = False
             st.rerun()
+
         st.divider()
-        if st.button("Criar dados de exemplo"):
+        pagina = st.radio(
+            "Menu",
+            [
+                "🗓️ Semanas",
+                "👥 Instrutores",
+                "⏰ Horários vagos",
+                "✅ Escolhas",
+                "📊 Quadro final",
+                "🔗 Link público",
+                "☁️ Ambiente/Nuvem",
+            ],
+            label_visibility="collapsed",
+            key="menu_admin_principal",
+        )
+
+        st.divider()
+        if st.button("Criar dados de exemplo", use_container_width=True):
             criar_dados_exemplo()
             st.rerun()
 
-    abas = st.tabs(
-        [
-            "1. Semanas",
-            "2. Instrutores",
-            "3. Horários vagos",
-            "4. Escolhas",
-            "5. Quadro final",
-            "6. Link público",
-            "7. Ambiente/Nuvem",
-        ]
-    )
-
-    with abas[0]:
+    # Diferente das abas, o menu lateral renderiza apenas uma página por vez.
+    # Isso deixa o app mais rápido no Supabase e evita consultas/desenhos desnecessários.
+    if pagina == "🗓️ Semanas":
         aba_semanas()
-    with abas[1]:
+    elif pagina == "👥 Instrutores":
         aba_instrutores()
-    with abas[2]:
+    elif pagina == "⏰ Horários vagos":
         aba_horarios()
-    with abas[3]:
+    elif pagina == "✅ Escolhas":
         aba_escolhas()
-    with abas[4]:
+    elif pagina == "📊 Quadro final":
         aba_quadro_final()
-    with abas[5]:
+    elif pagina == "🔗 Link público":
         aba_link_publico()
-    with abas[6]:
+    elif pagina == "☁️ Ambiente/Nuvem":
         aba_ambiente_nuvem()
-
-
 
 def aba_ambiente_nuvem() -> None:
     st.subheader("Ambiente e publicação online")
@@ -1793,45 +1924,70 @@ def aba_semanas() -> None:
 
 
 def aba_instrutores() -> None:
-    st.subheader("Cadastro de instrutores")
+    st.subheader("Instrutores")
+    card_html(
+        "Gerencie os instrutores da semana",
+        "Cadastre, edite, inative ou exclua instrutores. A exclusão permanente remove também as escolhas vinculadas a ele.",
+        "Cadastro",
+    )
 
-    with st.form("novo_instrutor"):
-        col1, col2, col3 = st.columns([1, 2, 1])
-        with col1:
-            posto = st.text_input("Posto/Graduação")
-        with col2:
-            nome = st.text_input("Nome *")
-        with col3:
-            matricula = st.text_input("Matrícula/Identificação")
-        telefone = st.text_input("Telefone/WhatsApp")
-        areas = st.text_input("Áreas/Habilitações", placeholder="Ex.: APH; Incêndio; Salvamento")
-        codigo_acesso = st.text_input("Código de acesso", placeholder="Opcional. Ex.: últimos 4 dígitos da matrícula")
-        salvar = st.form_submit_button("Cadastrar instrutor")
+    with st.expander("➕ Cadastrar novo instrutor", expanded=False):
+        with st.form("novo_instrutor"):
+            col1, col2, col3 = st.columns([1, 2, 1])
+            with col1:
+                posto = st.text_input("Posto/Graduação")
+            with col2:
+                nome = st.text_input("Nome *")
+            with col3:
+                matricula = st.text_input("Matrícula/Identificação")
+            telefone = st.text_input("Telefone/WhatsApp")
+            areas = st.text_input("Áreas/Habilitações", placeholder="Ex.: APH; Incêndio; Salvamento")
+            codigo_acesso = st.text_input("Código de acesso", placeholder="Opcional. Ex.: últimos 4 dígitos da matrícula")
+            salvar = st.form_submit_button("Cadastrar instrutor")
 
-    if salvar:
-        if not nome.strip():
-            st.error("Informe o nome.")
-        else:
-            try:
-                executar(
-                    """
-                    INSERT INTO instrutores (nome, posto_grad, matricula, telefone, areas, codigo_acesso, ativo)
-                    VALUES (?, ?, ?, ?, ?, ?, 1)
-                    """,
-                    (nome.strip(), posto.strip(), matricula.strip() or None, telefone.strip(), areas.strip(), codigo_acesso.strip() or None),
-                )
-                st.success("Instrutor cadastrado.")
-                st.rerun()
-            except DB_INTEGRITY_ERRORS:
-                st.error("Já existe instrutor com essa matrícula/identificação.")
+        if salvar:
+            if not nome.strip():
+                st.error("Informe o nome.")
+            else:
+                try:
+                    executar(
+                        """
+                        INSERT INTO instrutores (nome, posto_grad, matricula, telefone, areas, codigo_acesso, ativo)
+                        VALUES (?, ?, ?, ?, ?, ?, 1)
+                        """,
+                        (nome.strip(), posto.strip(), matricula.strip() or None, telefone.strip(), areas.strip(), codigo_acesso.strip() or None),
+                    )
+                    st.success("Instrutor cadastrado.")
+                    st.rerun()
+                except DB_INTEGRITY_ERRORS:
+                    st.error("Já existe instrutor com essa matrícula/identificação.")
 
     instrutores = listar_instrutores()
     if instrutores.empty:
         st.info("Nenhum instrutor cadastrado.")
         return
 
+    total_instrutores = len(instrutores)
+    ativos = int(pd.to_numeric(instrutores["ativo"], errors="coerce").fillna(0).sum()) if "ativo" in instrutores.columns else 0
+    inativos = max(0, total_instrutores - ativos)
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Total", total_instrutores)
+    c2.metric("Ativos", ativos)
+    c3.metric("Inativos", inativos)
+
+    st.markdown("### Lista de instrutores")
+    busca = st.text_input("Buscar instrutor", placeholder="Digite parte do nome, matrícula, posto ou área", key="buscar_instrutor")
+    instrutores_view = instrutores.copy()
+    if busca.strip():
+        termo = busca.strip().lower()
+        mascara = pd.Series(False, index=instrutores_view.index)
+        for coluna in ["nome", "posto_grad", "matricula", "telefone", "areas"]:
+            if coluna in instrutores_view.columns:
+                mascara = mascara | instrutores_view[coluna].fillna("").astype(str).str.lower().str.contains(termo, regex=False)
+        instrutores_view = instrutores_view[mascara]
+
     st.dataframe(
-        instrutores.rename(
+        instrutores_view.rename(
             columns={
                 "id": "ID",
                 "posto_grad": "Posto/Grad",
@@ -1847,21 +2003,29 @@ def aba_instrutores() -> None:
         hide_index=True,
     )
 
-    st.subheader("Editar instrutor")
+    st.divider()
+    st.markdown("### Editar ou excluir instrutor")
     opcoes = {}
     for _, row in instrutores.iterrows():
         instrutor_id_item = id_inteiro_seguro(row_get(row, "id"))
         if instrutor_id_item is None:
             continue
-        opcoes[f"{instrutor_id_item} - {formatar_instrutor(row)}"] = instrutor_id_item
+        status_txt = "ativo" if numero_inteiro_seguro(row_get(row, "ativo"), 0) == 1 else "inativo"
+        matricula_txt = row_get(row, "matricula") or "sem matrícula"
+        opcoes[f"{instrutor_id_item} • {formatar_instrutor(row)} • {matricula_txt} • {status_txt}"] = instrutor_id_item
     if not opcoes:
         st.warning("Nenhum instrutor com ID válido foi encontrado.")
         return
+
     escolha = st.selectbox("Instrutor", list(opcoes.keys()), key="editar_instrutor_select")
     instrutor_id = opcoes[escolha]
     row = obter_instrutor(instrutor_id)
-    if row:
-        with st.form("editar_instrutor"):
+    if not row:
+        st.warning("Instrutor não encontrado.")
+        return
+
+    with st.expander("✏️ Editar dados do instrutor", expanded=True):
+        with st.form(f"editar_instrutor_{instrutor_id}"):
             col1, col2, col3 = st.columns([1, 2, 1])
             with col1:
                 novo_posto = st.text_input("Posto/Graduação", value=row["posto_grad"] or "")
@@ -1872,8 +2036,9 @@ def aba_instrutores() -> None:
             novo_telefone = st.text_input("Telefone/WhatsApp", value=row["telefone"] or "")
             novas_areas = st.text_input("Áreas/Habilitações", value=row["areas"] or "")
             novo_codigo = st.text_input("Código de acesso", value=row["codigo_acesso"] or "", help="Se preenchido, o instrutor precisará informar este código no link público.")
-            novo_ativo = st.checkbox("Ativo", value=bool(row["ativo"]))
+            novo_ativo = st.checkbox("Ativo", value=bool(numero_inteiro_seguro(row["ativo"], 0)))
             salvar_instrutor = st.form_submit_button("Salvar alterações do instrutor")
+
         if salvar_instrutor:
             if not novo_nome.strip():
                 st.error("Informe o nome do instrutor.")
@@ -1901,6 +2066,39 @@ def aba_instrutores() -> None:
                 except DB_INTEGRITY_ERRORS:
                     st.error("Já existe outro instrutor com essa matrícula/identificação.")
 
+    with st.expander("🗑️ Inativar ou excluir instrutor", expanded=False):
+        st.warning("A exclusão permanente remove o instrutor e também suas escolhas/finalizações vinculadas. Para apenas impedir novas escolhas, prefira inativar.")
+        qtd_escolhas_row = consultar_um("SELECT COUNT(*) AS total FROM escolhas WHERE instrutor_id = ?", (instrutor_id,))
+        qtd_final_row = consultar_um("SELECT COUNT(*) AS total FROM finalizacoes WHERE instrutor_id = ?", (instrutor_id,))
+        qtd_escolhas = numero_inteiro_seguro(qtd_escolhas_row["total"] if qtd_escolhas_row else 0, 0)
+        qtd_final = numero_inteiro_seguro(qtd_final_row["total"] if qtd_final_row else 0, 0)
+        st.caption(f"Vínculos encontrados: {qtd_escolhas} escolha(s) e {qtd_final} finalização(ões).")
+
+        col_inativar, col_reativar = st.columns(2)
+        with col_inativar:
+            if st.button("Inativar instrutor", key=f"inativar_instrutor_{instrutor_id}", use_container_width=True):
+                executar("UPDATE instrutores SET ativo = 0 WHERE id = ?", (instrutor_id,))
+                st.success("Instrutor inativado. Ele não aparecerá mais no link público.")
+                st.rerun()
+        with col_reativar:
+            if st.button("Reativar instrutor", key=f"reativar_instrutor_{instrutor_id}", use_container_width=True):
+                executar("UPDATE instrutores SET ativo = 1 WHERE id = ?", (instrutor_id,))
+                st.success("Instrutor reativado.")
+                st.rerun()
+
+        with st.form(f"excluir_instrutor_{instrutor_id}"):
+            confirmacao = st.text_input("Para excluir permanentemente, digite EXCLUIR", key=f"confirmar_excluir_instrutor_{instrutor_id}")
+            excluir = st.form_submit_button("Excluir permanentemente")
+        if excluir:
+            if confirmacao.strip().upper() != "EXCLUIR":
+                st.error("Digite EXCLUIR para confirmar a exclusão permanente.")
+            else:
+                try:
+                    executar("DELETE FROM instrutores WHERE id = ?", (instrutor_id,))
+                    st.success("Instrutor excluído permanentemente.")
+                    st.rerun()
+                except DB_INTEGRITY_ERRORS as exc:
+                    st.error(f"Não foi possível excluir por vínculo no banco. Tente inativar ou remova os vínculos primeiro. Detalhe: {exc}")
 
 
 def aba_horarios() -> None:
@@ -2326,6 +2524,7 @@ def aba_link_publico() -> None:
 
 
 def main() -> None:
+    aplicar_estilo()
     init_db()
     pagina = get_query_param("pagina", "admin")
     token = get_query_param("token", "")
