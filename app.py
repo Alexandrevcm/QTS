@@ -61,7 +61,7 @@ except Exception:
     REPORTLAB_DISPONIVEL = False
 
 
-APP_NAME = "Quadro Semanal de Instrutores"
+APP_NAME = "Quadro de Trabalho Semanal"
 APP_VERSION = "1.3.8"
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
@@ -1343,7 +1343,7 @@ def formulario_login_admin() -> bool:
         return True
 
     st.subheader("Acesso administrativo")
-    st.info("Senha padrão inicial: admin123. Altere no arquivo `.streamlit/secrets.toml` antes de publicar o app.")
+    st.info("Digite a senha de administrador.")
     with st.form("login_admin"):
         senha = st.text_input("Senha", type="password")
         entrar = st.form_submit_button("Entrar")
