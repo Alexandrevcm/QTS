@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Quadro Semanal de Instrutores - v1.3
+Quadro Semanal de Instrutores - v1.3.2
 
 Sistema web simples para:
 - cadastrar instrutores;
@@ -20,6 +20,7 @@ Rodar localmente:
 from __future__ import annotations
 
 import io
+import inspect
 import sqlite3
 import uuid
 from datetime import date, datetime, time, timedelta
@@ -58,7 +59,7 @@ except Exception:
 
 
 APP_NAME = "Quadro Semanal de Instrutores"
-APP_VERSION = "1.3"
+APP_VERSION = "1.3.2"
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 DB_PATH = DATA_DIR / "quadro_instrutores.db"
@@ -82,6 +83,77 @@ DIAS_PT = {
 }
 
 STATUS_SEMANA = ["Aberta", "Encerrada", "Publicada"]
+
+
+def data_para_timestamp(valor: Any) -> pd.Timestamp:
+    """Converte datas vindas do SQLite/PostgreSQL para Timestamp sem derrubar o app.
+
+    Aceita date/datetime, YYYY-MM-DD, DD/MM/YYYY e timestamps ISO.
+    Se o valor vier vazio ou em formato inválido, retorna NaT.
+    """
+    if valor is None:
+        return pd.NaT
+    try:
+        if pd.isna(valor):
+            return pd.NaT
+    except Exception:
+        pass
+
+    if isinstance(valor, pd.Timestamp):
+        return valor
+    if isinstance(valor, datetime):
+        return pd.Timestamp(valor)
+    if isinstance(valor, date):
+        return pd.Timestamp(valor)
+
+    texto = str(valor).strip()
+    if not texto or texto.lower() in {"none", "nat", "nan", "null"}:
+        return pd.NaT
+
+    # Remove hora/timezone quando o campo representa uma data simples.
+    data_curta = texto[:10]
+    formatos = (
+        "%Y-%m-%d",
+        "%d/%m/%Y",
+        "%d-%m-%Y",
+        "%Y/%m/%d",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S",
+    )
+    for item in (texto, data_curta):
+        for formato in formatos:
+            try:
+                return pd.Timestamp(datetime.strptime(item, formato))
+            except Exception:
+                pass
+
+    try:
+        return pd.to_datetime(texto, errors="coerce", dayfirst=True)
+    except Exception:
+        return pd.NaT
+
+
+def formatar_data_br_valor(valor: Any) -> str:
+    ts = data_para_timestamp(valor)
+    if pd.isna(ts):
+        return "—"
+    return ts.strftime("%d/%m/%Y")
+
+
+def dia_semana_pt_valor(valor: Any) -> str:
+    ts = data_para_timestamp(valor)
+    if pd.isna(ts):
+        return "—"
+    return DIAS_PT.get(int(ts.weekday()), "—")
+
+
+def serie_formatar_data_br(serie: pd.Series) -> pd.Series:
+    return serie.apply(formatar_data_br_valor)
+
+
+def serie_dia_semana_pt(serie: pd.Series) -> pd.Series:
+    return serie.apply(dia_semana_pt_valor)
+
 
 
 # =============================================================================
@@ -894,8 +966,8 @@ def preparar_df_quadro(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame()
     saida = df.copy()
-    saida["Data"] = pd.to_datetime(saida["data_aula"]).dt.strftime("%d/%m/%Y")
-    saida["Dia"] = pd.to_datetime(saida["data_aula"]).dt.weekday.map(DIAS_PT)
+    saida["Data"] = serie_formatar_data_br(saida["data_aula"])
+    saida["Dia"] = serie_dia_semana_pt(saida["data_aula"])
     saida["Horário"] = saida.apply(lambda r: periodo_com_carga(r["hora_inicio"], r["hora_fim"], r.get("carga_horaria", 0)), axis=1)
     saida["Descrição"] = saida["disciplina"].apply(descricao_aula)
     saida["Vagas"] = saida["ocupadas"].astype(str) + "/" + saida["vagas"].astype(str)
@@ -1017,7 +1089,7 @@ def gerar_texto_whatsapp(df: pd.DataFrame, semana: sqlite3.Row) -> str:
 # =============================================================================
 
 
-def selecionar_semana(label: str = "Semana") -> int | None:
+def selecionar_semana(label: str = "Semana", key: str | None = None) -> int | None:
     semanas = listar_semanas()
     if semanas.empty:
         st.info("Nenhuma semana cadastrada ainda.")
@@ -1028,7 +1100,15 @@ def selecionar_semana(label: str = "Semana") -> int | None:
         nome = f"{row['titulo']} — {br_date(row['data_inicio'])} a {br_date(row['data_fim'])} — {row['status']}"
         opcoes[nome] = int(row["id"])
 
-    escolha = st.selectbox(label, list(opcoes.keys()))
+    if key is None:
+        frame = inspect.currentframe()
+        caller = frame.f_back if frame and frame.f_back else None
+        if caller is not None:
+            key = f"selecionar_semana_{caller.f_code.co_name}_{caller.f_lineno}"
+        else:
+            key = f"selecionar_semana_{label}"
+
+    escolha = st.selectbox(label, list(opcoes.keys()), key=key)
     return opcoes[escolha]
 
 
@@ -1161,7 +1241,7 @@ def pagina_escolha_publica(token: str) -> None:
         st.caption("Você ainda não escolheu horários nesta semana.")
     else:
         minhas_view = minhas.assign(
-            Data=lambda d: pd.to_datetime(d["data_aula"]).dt.strftime("%d/%m/%Y"),
+            Data=lambda d: serie_formatar_data_br(d["data_aula"]),
             Horário=lambda d: d.apply(lambda r: periodo_com_carga(r["hora_inicio"], r["hora_fim"], r.get("carga_horaria", 0)), axis=1),
             Descrição=lambda d: d["disciplina"].apply(descricao_aula),
         )
@@ -1177,6 +1257,7 @@ def pagina_escolha_publica(token: str) -> None:
                 f"{row['escolha_id']} | {br_date(row['data_aula'])} {periodo_com_carga(row['hora_inicio'], row['hora_fim'], row.get('carga_horaria', 0))} - {descricao_aula(row['disciplina'])}"
                 for _, row in minhas.iterrows()
             ],
+            key=f"cancelar_escolha_{semana['id']}_{instrutor_id}",
         )
         if escolha_cancelar != "Não cancelar" and st.button("Cancelar escolha selecionada"):
             escolha_id = int(escolha_cancelar.split("|")[0].strip())
@@ -1361,8 +1442,8 @@ def aba_semanas() -> None:
 
     st.dataframe(
         semanas.assign(
-            Início=lambda d: pd.to_datetime(d["data_inicio"]).dt.strftime("%d/%m/%Y"),
-            Fim=lambda d: pd.to_datetime(d["data_fim"]).dt.strftime("%d/%m/%Y"),
+            Início=lambda d: serie_formatar_data_br(d["data_inicio"]),
+            Fim=lambda d: serie_formatar_data_br(d["data_fim"]),
             Limite=lambda d: d["limite_horas_instrutor"].fillna(0).astype(int).astype(str) + "h/a",
         )[["id", "titulo", "Início", "Fim", "status", "Limite", "token", "observacoes"]].rename(
             columns={"id": "ID", "titulo": "Título", "status": "Status", "token": "Token", "observacoes": "Observações"}
@@ -1378,7 +1459,7 @@ def aba_semanas() -> None:
         if semana:
             col1, col2, col3 = st.columns([1, 2, 1])
             with col1:
-                novo_status = st.selectbox("Status", STATUS_SEMANA, index=STATUS_SEMANA.index(semana["status"]))
+                novo_status = st.selectbox("Status", STATUS_SEMANA, index=STATUS_SEMANA.index(semana["status"]), key=f"status_semana_{semana_id}")
             with col2:
                 novo_titulo = st.text_input("Título", value=semana["titulo"])
             with col3:
@@ -1483,7 +1564,7 @@ def aba_instrutores() -> None:
 
     st.subheader("Editar instrutor")
     opcoes = {f"{row['id']} - {formatar_instrutor(row)}": int(row["id"]) for _, row in instrutores.iterrows()}
-    escolha = st.selectbox("Instrutor", list(opcoes.keys()))
+    escolha = st.selectbox("Instrutor", list(opcoes.keys()), key="editar_instrutor_select")
     instrutor_id = opcoes[escolha]
     row = obter_instrutor(instrutor_id)
     if row:
@@ -1666,7 +1747,7 @@ def aba_horarios() -> None:
         f"{row['horario_id']} | {br_date(row['data_aula'])} {periodo_com_carga(row['hora_inicio'], row['hora_fim'], row.get('carga_horaria', 0))} - {descricao_aula(row['disciplina'])}": int(row["horario_id"])
         for _, row in quadro.iterrows()
     }
-    escolha = st.selectbox("Horário", list(opcoes.keys()))
+    escolha = st.selectbox("Horário", list(opcoes.keys()), key=f"editar_horario_{semana_id}")
     horario_id = opcoes[escolha]
     horario = consultar_um("SELECT * FROM horarios WHERE id = ?", (horario_id,))
     if horario:
@@ -1747,7 +1828,7 @@ def aba_escolhas() -> None:
         st.info("Nenhuma escolha registrada nesta semana.")
     else:
         df_view = df.assign(
-            Data=lambda d: pd.to_datetime(d["data_aula"]).dt.strftime("%d/%m/%Y"),
+            Data=lambda d: serie_formatar_data_br(d["data_aula"]),
             Horário=lambda d: d.apply(lambda r: periodo_com_carga(r["hora_inicio"], r["hora_fim"], r.get("carga_horaria", 0)), axis=1),
             Descrição=lambda d: d["disciplina"].apply(descricao_aula),
         )
@@ -1783,8 +1864,8 @@ def aba_escolhas() -> None:
         }
         opcoes_i = {f"{row['id']} | {formatar_instrutor(row)} - {row['matricula'] or 'sem matrícula'}": int(row["id"]) for _, row in instrutores.iterrows()}
         with st.form("adicionar_escolha_admin"):
-            horario_label = st.selectbox("Horário", list(opcoes_h.keys()))
-            instrutor_label = st.selectbox("Instrutor", list(opcoes_i.keys()))
+            horario_label = st.selectbox("Horário", list(opcoes_h.keys()), key=f"admin_adicionar_horario_{semana_id}")
+            instrutor_label = st.selectbox("Instrutor", list(opcoes_i.keys()), key=f"admin_adicionar_instrutor_{semana_id}")
             adicionar = st.form_submit_button("Adicionar escolha")
         if adicionar:
             ok, msg = escolher_horario(opcoes_i[instrutor_label], opcoes_h[horario_label], origem_admin=True)
@@ -1801,7 +1882,7 @@ def aba_escolhas() -> None:
             f"{row['escolha_id']} | {br_date(row['data_aula'])} {periodo_com_carga(row['hora_inicio'], row['hora_fim'], row.get('carga_horaria', 0))} - {row['instrutor']} - {descricao_aula(row['disciplina'])}": int(row["escolha_id"])
             for _, row in df.iterrows()
         }
-        escolha = st.selectbox("Escolha", list(opcoes.keys()))
+        escolha = st.selectbox("Escolha", list(opcoes.keys()), key=f"remover_escolha_{semana_id}")
         if st.button("Remover escolha selecionada"):
             executar("DELETE FROM escolhas WHERE id = ?", (opcoes[escolha],))
             st.success("Escolha removida.")
