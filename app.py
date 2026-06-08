@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Quadro Semanal de Instrutores - v1.3.9
+Quadro Semanal de Instrutores - v1.4.0
 
 Sistema web simples para:
 - cadastrar instrutores;
@@ -16,7 +16,8 @@ Sistema web simples para:
 - corrigir geração/visualização da grade padrão no PostgreSQL/Streamlit Cloud;
 - adicionar cache de consultas, identificação por seleção e finalização do instrutor;
 - permitir exclusão segura de instrutores;
-- melhorar a interface administrativa com menu lateral e visual de app.
+- melhorar a interface administrativa com menu lateral e visual de app;
+- exibir/exportar o quadro final em formato semanal matricial.
 
 Rodar localmente:
     streamlit run app.py
@@ -24,6 +25,7 @@ Rodar localmente:
 
 from __future__ import annotations
 
+import html
 import io
 import inspect
 import sqlite3
@@ -34,6 +36,7 @@ from typing import Any
 
 import pandas as pd
 import streamlit as st
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
 try:
@@ -64,7 +67,7 @@ except Exception:
 
 
 APP_NAME = "Quadro Semanal de Instrutores"
-APP_VERSION = "1.3.9"
+APP_VERSION = "1.4.0"
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 DB_PATH = DATA_DIR / "quadro_instrutores.db"
@@ -157,6 +160,60 @@ def aplicar_estilo() -> None:
                 overflow: hidden;
                 background: var(--qts-bg-card);
                 box-shadow: 0 8px 24px rgba(15, 23, 42, 0.04);
+            }
+
+            .qts-grade-wrap {
+                width: 100%;
+                overflow-x: auto;
+                border-radius: 14px;
+                border: 1px solid #111827;
+                box-shadow: 0 10px 28px rgba(15, 23, 42, 0.06);
+                background: #ffffff;
+                margin-top: 0.5rem;
+                margin-bottom: 1rem;
+            }
+
+            table.qts-grade-final {
+                border-collapse: collapse;
+                width: 100%;
+                min-width: 850px;
+                font-size: 0.98rem;
+                background: #ffffff;
+            }
+
+            table.qts-grade-final th,
+            table.qts-grade-final td {
+                border: 1px solid #111827;
+                padding: 0.38rem 0.45rem;
+                vertical-align: middle;
+                min-height: 2rem;
+            }
+
+            table.qts-grade-final th {
+                background: #f8fafc;
+                color: #0f172a;
+                font-weight: 700;
+                text-align: left;
+                line-height: 1.15;
+            }
+
+            table.qts-grade-final td {
+                color: #111827;
+                text-align: center;
+                white-space: pre-line;
+            }
+
+            table.qts-grade-final td.qts-horario {
+                text-align: left;
+                font-weight: 500;
+                white-space: nowrap;
+                background: #ffffff;
+            }
+
+            table.qts-grade-final tr.qts-linha-intervalo td {
+                background: #f8fafc;
+                font-weight: 600;
+                text-align: left;
             }
 
             .qts-card {
@@ -1334,6 +1391,240 @@ def preparar_df_quadro(df: pd.DataFrame) -> pd.DataFrame:
         }
     )
 
+
+def preparar_quadro_grade(df: pd.DataFrame, semana: sqlite3.Row | dict[str, Any] | pd.Series | None = None) -> pd.DataFrame:
+    """Monta o quadro final no formato semanal matricial.
+
+    Colunas: segunda a sexta, com data no cabeçalho.
+    Linhas: horários da semana e uma linha de intervalo entre manhã e tarde.
+    Células: instrutores confirmados naquele dia/horário.
+    """
+    if df.empty:
+        return pd.DataFrame()
+
+    dados = df.copy()
+    dados["_data"] = dados["data_aula"].apply(data_para_date)
+    dados["_hora_inicio"] = dados["hora_inicio"].astype(str).str[:5]
+    dados["_hora_fim"] = dados["hora_fim"].astype(str).str[:5]
+    dados["_carga"] = dados["carga_horaria"].apply(lambda v: numero_inteiro_seguro(v, 0))
+    dados = dados[dados["_data"].notna()].copy()
+    if dados.empty:
+        return pd.DataFrame()
+
+    dias: list[date] = []
+    if semana is not None:
+        try:
+            dias = datas_uteis_da_semana(semana["data_inicio"], semana["data_fim"])
+        except Exception:
+            dias = []
+    if not dias:
+        dias = sorted({d for d in dados["_data"].tolist() if d is not None})
+    # Mantém o visual semanal clássico: segunda a sexta. Se houver sábado/domingo cadastrado,
+    # eles entram também, mas ao final.
+    dias = sorted(dias)
+
+    colunas_dias = [f"{DIAS_PT.get(d.weekday(), 'Dia')}\n{br_date(d)}" for d in dias]
+
+    periodos = (
+        dados[["_hora_inicio", "_hora_fim", "_carga"]]
+        .drop_duplicates()
+        .sort_values(["_hora_inicio", "_hora_fim"])
+        .itertuples(index=False, name=None)
+    )
+    periodos = list(periodos)
+
+    linhas: list[dict[str, Any]] = []
+    intervalo_inserido = False
+    houve_manha = False
+
+    for hora_inicio, hora_fim, carga in periodos:
+        try:
+            ini = parse_hora(str(hora_inicio))
+        except Exception:
+            ini = time(0, 0)
+
+        if ini < time(12, 0):
+            houve_manha = True
+        elif houve_manha and not intervalo_inserido:
+            linha_intervalo = {"Horário": "Intervalo"}
+            for coluna in colunas_dias:
+                linha_intervalo[coluna] = "Intervalo"
+            linhas.append(linha_intervalo)
+            intervalo_inserido = True
+
+        linha = {"Horário": periodo_com_carga(str(hora_inicio), str(hora_fim), carga)}
+        for dia, coluna in zip(dias, colunas_dias):
+            encontrados = dados[
+                (dados["_data"] == dia)
+                & (dados["_hora_inicio"] == str(hora_inicio))
+                & (dados["_hora_fim"] == str(hora_fim))
+            ]
+
+            nomes: list[str] = []
+            for _, item in encontrados.iterrows():
+                instrutores = row_get(item, "instrutores", "")
+                if pd.isna(instrutores) or not str(instrutores).strip():
+                    continue
+                partes = [p.strip() for p in str(instrutores).split(";") if p.strip()]
+                nomes.extend(partes)
+
+            # Remove duplicidades preservando a ordem.
+            nomes_unicos = list(dict.fromkeys(nomes))
+            linha[coluna] = "\n".join(nomes_unicos)
+        linhas.append(linha)
+
+    if not linhas:
+        return pd.DataFrame()
+    return pd.DataFrame(linhas, columns=["Horário"] + colunas_dias)
+
+
+def quadro_grade_html(df: pd.DataFrame) -> str:
+    """Renderiza a matriz em HTML com visual semelhante ao modelo enviado."""
+    if df.empty:
+        return "<p>Nenhum horário cadastrado.</p>"
+
+    def celula(valor: Any, cabecalho: bool = False) -> str:
+        texto = "" if valor is None else str(valor)
+        texto = html.escape(texto).replace("\n", "<br>")
+        tag = "th" if cabecalho else "td"
+        return f"<{tag}>{texto}</{tag}>"
+
+    partes = [
+        "<div class='qts-grade-wrap'>",
+        "<table class='qts-grade-final'>",
+        "<thead><tr>",
+    ]
+    for coluna in df.columns:
+        partes.append(celula("" if coluna == "Horário" else coluna, cabecalho=True))
+    partes.append("</tr></thead><tbody>")
+
+    for _, row in df.iterrows():
+        is_intervalo = str(row.get("Horário", "")).strip().lower() == "intervalo"
+        partes.append("<tr class='qts-linha-intervalo'>" if is_intervalo else "<tr>")
+        for idx, coluna in enumerate(df.columns):
+            valor = row.get(coluna, "")
+            if idx == 0:
+                partes.append(celula(valor, cabecalho=False).replace("<td>", "<td class='qts-horario'>", 1))
+            else:
+                partes.append(celula(valor, cabecalho=False))
+        partes.append("</tr>")
+
+    partes.append("</tbody></table></div>")
+    return "".join(partes)
+
+
+def exportar_excel_grade(df: pd.DataFrame, titulo: str) -> bytes:
+    """Exporta o quadro final no formato semanal/matricial."""
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Quadro", startrow=2)
+        ws = writer.book["Quadro"]
+        total_colunas = max(1, len(df.columns))
+
+        ws["A1"] = titulo
+        ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=total_colunas)
+        ws["A1"].font = Font(bold=True, size=14)
+        ws["A1"].alignment = Alignment(horizontal="center", vertical="center")
+        ws.row_dimensions[1].height = 24
+
+        thin = Side(style="thin", color="000000")
+        border = Border(left=thin, right=thin, top=thin, bottom=thin)
+        header_fill = PatternFill("solid", fgColor="F2F4F7")
+        intervalo_fill = PatternFill("solid", fgColor="F8FAFC")
+
+        header_row = 3
+        for cell in ws[header_row]:
+            cell.font = Font(bold=True)
+            cell.fill = header_fill
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            cell.border = border
+        ws.row_dimensions[header_row].height = 36
+
+        for row_idx in range(header_row + 1, ws.max_row + 1):
+            horario = str(ws.cell(row=row_idx, column=1).value or "")
+            is_intervalo = horario.strip().lower() == "intervalo"
+            ws.row_dimensions[row_idx].height = 24 if is_intervalo else 30
+            for col_idx in range(1, ws.max_column + 1):
+                cell = ws.cell(row=row_idx, column=col_idx)
+                cell.border = border
+                cell.alignment = Alignment(
+                    horizontal="left" if col_idx == 1 else "center",
+                    vertical="center",
+                    wrap_text=True,
+                )
+                if col_idx == 1 or is_intervalo:
+                    cell.font = Font(bold=is_intervalo)
+                if is_intervalo:
+                    cell.fill = intervalo_fill
+
+        for col_idx in range(1, ws.max_column + 1):
+            col_letter = get_column_letter(col_idx)
+            ws.column_dimensions[col_letter].width = 24 if col_idx == 1 else 22
+
+        ws.freeze_panes = "B4"
+
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def exportar_pdf_grade(df: pd.DataFrame, titulo: str) -> bytes:
+    """Exporta o quadro final em PDF no mesmo formato semanal."""
+    if not REPORTLAB_DISPONIVEL:
+        raise RuntimeError("Biblioteca reportlab não está instalada.")
+
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=landscape(A4),
+        leftMargin=18,
+        rightMargin=18,
+        topMargin=18,
+        bottomMargin=18,
+    )
+    styles = getSampleStyleSheet()
+    normal = styles["BodyText"]
+    normal.fontSize = 8
+    normal.leading = 10
+
+    elementos = [Paragraph(html.escape(titulo), styles["Title"]), Spacer(1, 8)]
+
+    def p(valor: Any) -> Paragraph:
+        texto = "" if valor is None else str(valor)
+        texto = html.escape(texto).replace("\n", "<br/>")
+        return Paragraph(texto, normal)
+
+    tabela_dados = [[p("" if col == "Horário" else col) for col in df.columns]]
+    for _, row in df.iterrows():
+        tabela_dados.append([p(row.get(col, "")) for col in df.columns])
+
+    largura_total = landscape(A4)[0] - 36
+    primeira = 118
+    demais = max(80, (largura_total - primeira) / max(1, len(df.columns) - 1))
+    col_widths = [primeira] + [demais] * (len(df.columns) - 1)
+
+    tabela = Table(tabela_dados, colWidths=col_widths, repeatRows=1)
+    estilos = [
+        ("BACKGROUND", (0, 0), (-1, 0), colors.whitesmoke),
+        ("GRID", (0, 0), (-1, -1), 0.6, colors.black),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("ALIGN", (1, 0), (-1, -1), "CENTER"),
+        ("ALIGN", (0, 0), (0, -1), "LEFT"),
+        ("FONTSIZE", (0, 0), (-1, -1), 8),
+    ]
+    for row_idx in range(1, len(tabela_dados)):
+        if str(df.iloc[row_idx - 1].get("Horário", "")).strip().lower() == "intervalo":
+            estilos.extend([
+                ("BACKGROUND", (0, row_idx), (-1, row_idx), colors.whitesmoke),
+                ("FONTNAME", (0, row_idx), (-1, row_idx), "Helvetica-Bold"),
+            ])
+    tabela.setStyle(TableStyle(estilos))
+
+    elementos.append(tabela)
+    doc.build(elementos)
+    buffer.seek(0)
+    return buffer.getvalue()
+
 def exportar_excel(df: pd.DataFrame, titulo: str) -> bytes:
     """
     Exporta o quadro para Excel.
@@ -2439,8 +2730,14 @@ def aba_quadro_final() -> None:
     col5.metric("Carga total", f"{carga_total}h/a")
     st.caption(f"Status da semana: {semana['status']} | Limite por instrutor: {'sem limite' if limite_horas_da_semana(semana) <= 0 else str(limite_horas_da_semana(semana)) + 'h/a'}")
 
+    quadro_grade = preparar_quadro_grade(quadro, semana)
     quadro_view = preparar_df_quadro(quadro)
-    st.dataframe(quadro_view, use_container_width=True, hide_index=True)
+
+    st.markdown("### Quadro semanal")
+    st.markdown(quadro_grade_html(quadro_grade), unsafe_allow_html=True)
+
+    with st.expander("Ver detalhes por horário"):
+        st.dataframe(quadro_view, use_container_width=True, hide_index=True)
 
     cargas = carga_por_instrutor_semana(semana_id)
     if not cargas.empty:
@@ -2464,7 +2761,7 @@ def aba_quadro_final() -> None:
             st.rerun()
 
     titulo = f"{semana['titulo']} - {br_date(semana['data_inicio'])} a {br_date(semana['data_fim'])}"
-    excel_bytes = exportar_excel(quadro_view, titulo)
+    excel_bytes = exportar_excel_grade(quadro_grade, titulo)
     st.download_button(
         "Baixar quadro em Excel",
         data=excel_bytes,
@@ -2473,7 +2770,7 @@ def aba_quadro_final() -> None:
     )
 
     if REPORTLAB_DISPONIVEL:
-        pdf_bytes = exportar_pdf(quadro_view, titulo)
+        pdf_bytes = exportar_pdf_grade(quadro_grade, titulo)
         st.download_button(
             "Baixar quadro em PDF",
             data=pdf_bytes,
